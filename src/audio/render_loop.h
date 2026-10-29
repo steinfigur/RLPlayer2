@@ -433,6 +433,9 @@ inline void render_loop(OutSink& sink, RenderHost& h) {
                 // Publish the target and its epoch as one request. A completed
                 // producer epoch becomes active again before the consumer reads EOF.
                 std::lock_guard<std::mutex> lk(RQ.mtx);
+                // An input failure exits the producer. Reopening its EOF would wait
+                // forever for a generation that nobody can produce.
+                if (RQ.error) break;
                 myEpoch = RQ.epoch.fetch_add(1) + 1;
                 RQ.seekFrame.store((long long)(sk * (double)h.inFrames));
                 RQ.done = false;

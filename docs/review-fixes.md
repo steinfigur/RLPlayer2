@@ -125,7 +125,7 @@ F12不能解释为禁止已确认缺失条目的独立自动清理。仓库明�
 |---|---|---|
 | P1：空闲或暂停中的seek泄漏到下一会话 | `tools/rtaweb.cpp`：`PlayerState`、play/lib-play/skip/cast/stop/clear启动交接 | 旧真实exe复现新曲直接从75%处开始。join旧会话后统一`resetControls()`；新会话从零开始，暂停中的待处理seek同样不能泄漏。 |
 | P1：暂停换曲后新曲永久停在0 | 同上 | 旧真实exe复现`playing=true, paused=true, pos=0`。控制请求及实际paused状态随旧会话复位；换曲、skip、clear与stop场景分别验收。 |
-| P2：生产者异常仍被标记正常EOF | `src/audio/render_loop.h`：`pull_chunk/render_loop` | 原正式头文件回归在第528项失败。持队列锁读取done/error，排空有效前缀后不设置normalEnd；保留外层错误传播与停止续播。1/2声道、3/15/16/17帧、每次仅写3帧同时覆盖。 |
+| P2：生产者异常仍被标记正常EOF | `src/audio/render_loop.h`：`pull_chunk/render_loop` | 原正式头文件回归在第528项失败。持队列锁读取done/error，排空有效前缀后不设置normalEnd；保留外层错误传播与停止续播。另一个真实头文件反例在第900项证实：输入失败后seek会重开已经退出的生产者并等待；现持锁拒绝该重开，错误继续由外层传播，正常EOF后seek仍保留。1/2声道、3/15/16/17帧、每次仅写3帧同时覆盖。 |
 | P1：更新包大小未经校验便窄化 | `src/net/update.h`：`parse_manifest_ext`；`update_staging.h`：`parse_manifest_size` | 旧`update_probe --plan`对1e300、负数、小数、字符串均退出0。包/full/files/staging统一要求非负且精确可表示整数，窄化前拒绝；保留可选大小缺省0，验收0/1/2^53-1与越界/错误类型。 |
 | P2：Knowledge缓存整数越界、失败可能留下部分输出 | `src/meta/knowledge.h`：`knowledge_from_json` | 时间和authority在窄化前检查类型/整数/范围；全部材料解析完成后才发布输出。新增18种坏值组合及输出不变断言，缺省元数据仍兼容零。 |
 | P2：完整请求头末块绕过64KB限制 | `src/net/webui.h`：`WebUi::handle` | 找到分隔符后也检查头部长度；允许有效极限头的结束分隔符分片到达。真实Winsock测cap-1/cap/cap+1/cap+2048及逐字节结束符。 |
@@ -137,9 +137,11 @@ F12不能解释为禁止已确认缺失条目的独立自动清理。仓库明�
 
 边界诊断还发现：本机畸形HTTP请求发送完后立即半关闭连接，客户端可能收到ECONNRESET。完全独立的Node TCP回显服务对相同输入也复现，正常请求成功；替换发送标志或显式shutdown的实验均未消除。该现象的系统层原因尚未精确定位，因此不能据此认定RLPlayer特有bug，也没有修改生产传输来掩盖它。复现入口为`node tests/probe_http_half_close.js`，该诊断非零结果不会计成CTest通过。正式HTTP回归保留合法完整请求半关闭，畸形/短body用保持连接并触发接收超时的方式验证同一拒绝分支；畸形半关闭路径仍受本机网络环境限制，未声称验证通过。
 
-本轮证据位于仓库外`../review-fixes/double-check/`：`app-baseline.log`、`queue-baseline.log`、`manifest-baseline.log`、`dsp-baseline.log`、`http-baseline.log`、`echo-control.log`、`build-final.log`、`platform-boundary.log`及`targeted.log`。Linux GCC的UBSAN及float-cast-overflow运行26项暂存/数值契约检查，退出0。WSL直接启动Windows PowerShell时，本轮观察到其原生子进程未执行且无退出码；这些无效驱动结果不计成功。正式Windows构建及CTest均经Windows cmd父进程启动，并检查实际退出码。最终远端结果以本轮提交对应的Actions记录为准，交付对话附精确运行链接。
+本轮证据位于仓库外`../review-fixes/double-check/`：`app-baseline.log`、`queue-baseline.log`、`manifest-baseline.log`、`dsp-baseline.log`、`failed-seek-baseline.log`、`http-baseline.log`、`echo-control.log`、`build-final.log`、`platform-boundary.log`及`targeted.log`。Linux GCC的UBSAN及float-cast-overflow运行26项暂存/数值契约检查，退出0。WSL直接启动Windows PowerShell时，本轮观察到其原生子进程未执行且无退出码；这些无效驱动结果不计成功。正式Windows构建及CTest均经Windows cmd父进程启动，并检查实际退出码。最终远端结果以本轮提交对应的Actions记录为准，交付对话附精确运行链接。
 
-本轮最终本地相关CTest：**18目标、0失败、0跳过、退出0，102.55秒**。其中真实应用13个边界场景、HTTP17项、Windows音频/回调1031项、元数据130项、更新41项；[验收摘要](review-evidence/double-check-verification.json)绑定本轮rtaweb二进制摘要。完整CI会在最终提交重新运行。未穷举所有线程交错及播放中任意队列编辑的排列组合；真实DAC/ASIO/GPU、在线服务、私有曲库和断电耐久仍不在验证范围内。
+第一阶段`917169d`本地相关CTest：**18目标、0失败、0跳过、退出0，102.55秒**。其中真实应用13个边界场景、HTTP17项、Windows音频/回调1031项、元数据130项、更新41项；[验收摘要](review-evidence/double-check-verification.json)绑定本轮rtaweb二进制摘要。完整CI按最终提交重新运行，精确运行链接随对话交付。未穷举所有线程交错及播放中任意队列编辑的排列组合；真实DAC/ASIO/GPU、在线服务、私有曲库和断电耐久仍不在验证范围内。
+
+加入输入失败后seek的终止门后，最终再次运行相关CTest：**18目标、0失败、0跳过、退出0，58.27秒**。真实应用13场景、HTTP17项、元数据130项、更新41项不变；音频/回调915项，数量变化来自失败seek案例现在按合同写出3帧后终止，不再继续验证不应写出的补齐尾块。最新二进制摘要已同步到验收摘要；独立日志为`build-terminal-final.log`、`terminal-targeted.log`。
 
 ## 复现入口
 

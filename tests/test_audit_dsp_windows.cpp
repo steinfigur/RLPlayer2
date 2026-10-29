@@ -72,10 +72,11 @@ static void files(const std::filesystem::path&dir) {
         rejected=false;try{audio::read_wav(wf);}catch(const std::runtime_error&){rejected=true;}ck(rejected,"WAV whole reader rejects same malformed format");}
 }
 struct CaptureSink:render::OutSink {
-    std::function<void()> firstWrite;std::vector<int32_t>out;int ch=2;double gain=-1;bool mode=false;size_t limit=3;std::string err;
+    std::function<void()> firstWrite,onWait;std::vector<int32_t>out;int ch=2;double gain=-1;bool mode=false;size_t limit=3;std::string err;
     bool open(const render::SinkOpenOpts&,uint32_t,int,int)override{return true;}bool start()override{return true;}
     size_t buffer_frames()const override{return 16;}const std::string&last_error()const override{return err;}
     void set_live_gain_db(double v)override{gain=v;}void set_dop_mode(bool v)override{mode=v;}
+    bool wait_event(int)override{if(onWait)onWait();return false;}
     size_t write_one_period(const int32_t*p,size_t n)override{size_t count=std::min(limit,n);const bool first=out.empty();out.insert(out.end(),p,p+count*ch);if(first&&firstWrite)firstWrite();return count;}
 };
 static void rendering() {
@@ -88,6 +89,8 @@ static void rendering() {
         h.rq=&q;h.deviceRate=176400;h.inRate=176400;h.inFrames=frames;h.totalOut=frames;h.outBits=24;h.outCh=channels;h.dbgW0=&w0;h.dbgWr=&wr;h.dbgPulls=&pulls;h.dbgClip=&clip;h.dbgPeak=&peak;
         h.dop=true;h.starveEnabled=false;h.deviceGuardEnabled=false;CaptureSink sink;sink.ch=channels;
         const bool doSeek=!producerError&&channels==2&&frames==17;
+        const bool failedSeek=producerError&&channels==2&&frames==17;
+        if(failedSeek){sink.firstWrite=[&]{seek.store(.5);};sink.onWait=[&]{if(q.epoch.load()!=1)throw std::runtime_error("seek reopened an exited producer after input failure");};}
         std::thread simulatedProducer;
         if(doSeek) {
             sink.firstWrite=[&]{seek.store(.5);};
@@ -104,9 +107,9 @@ static void rendering() {
         render::render_loop(sink,h);
         if(simulatedProducer.joinable())simulatedProducer.join();
         ck(h.normalEnd==!producerError&&!h.renderFail&&sink.mode&&sink.gain==0,"producer failure cannot report normal EOF; DoP mode and gain remain correct");
-        ck(played.load()==(doSeek?13:frames),"EOF device padding does not advance source progress");
-        const size_t sourceFrames=doSeek?8:frames;
-        ck(sink.out.size()==((sourceFrames+15)/16)*16*channels,"DoP EOF exact bounded final device block");
+        ck(played.load()==(failedSeek?3:doSeek?13:frames),"EOF device padding does not advance source progress");
+        const size_t sourceFrames=failedSeek?3:doSeek?8:frames;
+        ck(sink.out.size()==(failedSeek?3:((sourceFrames+15)/16)*16)*channels,"DoP EOF exact bounded final device block");
         for(size_t n=0;n<sink.out.size()/(size_t)channels;++n)for(int c=0;c<channels;++c){auto v=(uint32_t)sink.out[n*channels+c];
             ck(((v>>16)&255)==(n%2?0xfa:5),"render actual-written continuous markers with partial writes");
             const uint32_t expect=doSeek?(n<3?(uint32_t)((n*17+c)&0xffff):(n<8?0xbeefu:0x6969u)):

@@ -3,7 +3,7 @@
   "local_build": {
     "toolchain": "Windows LLVM clang++ 23.1.4 / VS2022 SDK / CMake Release",
     "exit_code": 0,
-    "rtaweb_sha256": "99d6d8905189e3542fd51d3c8cf38e83d7ef6cb7a2ff268ff6c90484d3545db0"
+    "rtaweb_sha256": "ca7285093d0e7481af187753ef553ae4bc4c8806da26fc85d38685afff353ea5"
   },
   "related_ctest": {
     "Total": 18,
@@ -11,12 +11,12 @@
     "Failed": 0,
     "InternalSkipOnly": 0,
     "exit_code": 0,
-    "seconds": 102.55
+    "seconds": 58.27
   },
   "checks": {
     "application_edge_scenarios": 13,
     "http_edges": 17,
-    "windows_audio": 1031,
+    "windows_audio": 915,
     "metadata": 130,
     "update_transactions_and_manifest": 41,
     "portable_staging_ubsan": 26
@@ -28,7 +28,8 @@
     "invalid archive size accepted",
     "oversized completed header bypasses limit",
     "cleared shuffle queue resurrects",
-    "appended entry lost on leaving shuffle"
+    "appended entry lost on leaving shuffle",
+    "seek reopens a generation after its producer has failed and exited"
   ],
   "not_proven": [
     "physical DAC/ASIO/GPU",
@@ -38,5 +39,17 @@
   ],
   "capability_limit": "UPnP album-queue playback is explicitly rejected; existing single-track casting remains available",
   "environment_probe": "tests/probe_http_half_close.js is diagnostic, not a passing CTest gate",
-  "evidence_directory": "../review-fixes/double-check (outside source repository)"
+  "evidence_directory": "../review-fixes/double-check (outside source repository)",
+  "previous_phase_917169d": {
+    "related_ctest": {
+      "Total": 18,
+      "Skipped": 0,
+      "Failed": 0,
+      "InternalSkipOnly": 0,
+      "exit_code": 0,
+      "seconds": 102.55
+    },
+    "windows_audio_checks": 1031
+  },
+  "audio_count_note": "The failed-input seek case must terminate after three written frames; it no longer validates padding that must never be written."
 }
