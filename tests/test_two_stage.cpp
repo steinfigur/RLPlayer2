@@ -12,6 +12,14 @@
 #include <string>
 #include <chrono>
 #include <algorithm>
+#include <ctime>
+#include <cstdint>
+#include <numeric>
+#include <stdexcept>
+#include <thread>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 using namespace rta::dsp;
 
@@ -59,23 +67,68 @@ static double image_db(ResamplerConfig cfg, double toneHz, double imageHz, size_
     return 20.0 * std::log10((magI + 1e-300) / (magT + 1e-300));
 }
 
-static void run_bench(bool twoStage, double* msOut) {
+// The gate asks for CPU cost, not scheduler-dependent elapsed time. On Windows,
+// measure this thread's kernel+user CPU directly.
+static double thread_cpu_ms() {
+#ifdef _WIN32
+    FILETIME created{}, ended{}, kernel{}, user{};
+    if (!GetThreadTimes(GetCurrentThread(), &created, &ended, &kernel, &user))
+        throw std::runtime_error("GetThreadTimes failed");
+    auto ticks = [](FILETIME t) { return ((uint64_t)t.dwHighDateTime << 32) | t.dwLowDateTime; };
+    return (double)(ticks(kernel) + ticks(user)) / 10000.0;
+#else
+    const auto value = std::clock();
+    if (value == (std::clock_t)-1) throw std::runtime_error("CPU clock unavailable");
+    return (double)value * 1000.0 / CLOCKS_PER_SEC;
+#endif
+}
+struct BenchSample { double cpuMs, wallMs; size_t calls; };
+static volatile double benchResult = 0.0;
+static BenchSample run_bench(bool twoStage) {
     ResamplerConfig cfg;
     cfg.inRate = 44100; cfg.outRate = 705600; cfg.channels = 1;
     cfg.totalTaps = 32768; cfg.twoStage = twoStage;
     PolyphaseResampler rs(cfg);
-    const size_t N = 4410;                 // 0.1 秒
+    const size_t N = 4410;                 // Same 0.1-second input as the original gate.
     std::vector<double> x(N), o(rs.maxOutFrames(N) + 16);
     for (size_t n = 0; n < N; ++n) x[n] = 0.3 * std::sin(2.0 * PI * 997.0 * n / 44100.0);
     const double* ip[1] = { x.data() };
     double* op[1] = { o.data() };
-    const auto t0 = std::chrono::steady_clock::now();
-    rs.process(ip, N, op);
-    const auto t1 = std::chrono::steady_clock::now();
-    *msOut = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    rs.process(ip, N, op);                  // Warm the actual streaming path and buffers.
+    const auto wallStart = std::chrono::steady_clock::now();
+    const double cpuStart = thread_cpu_ms();
+    double elapsedCpu = 0.0;
+    size_t calls = 0, got = 0;
+    do {
+        got = rs.process(ip, N, op);
+        if (!got) throw std::runtime_error("benchmark produced no samples");
+        ++calls;
+        elapsedCpu = thread_cpu_ms() - cpuStart;
+        if (std::chrono::steady_clock::now() - wallStart > std::chrono::seconds(10))
+            throw std::runtime_error("insufficient CPU time for performance measurement");
+    } while (elapsedCpu < 250.0);           // Amortize CPU-clock resolution over a real batch.
+    const double elapsedWall = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - wallStart).count();
+    benchResult = std::accumulate(o.begin(), o.begin() + (long long)got, 0.0);
+    return {elapsedCpu / calls, elapsedWall / calls, calls};
+}
+static double bench_speedup(bool candidateTwoStage, const char* label) {
+    std::vector<double> ratios;
+    for (int trial = 0; trial < 5; ++trial) {
+        BenchSample one{}, candidate{};
+        if (trial % 2 == 0) { one = run_bench(false); candidate = run_bench(candidateTwoStage); }
+        else { candidate = run_bench(candidateTwoStage); one = run_bench(false); }
+        const double ratio = one.cpuMs / candidate.cpuMs;
+        printf("  %s pair %d: CPU %.3f/%.3f ms, wall %.3f/%.3f ms, calls %zu/%zu, ratio %.3fx\n",
+               label, trial + 1, one.cpuMs, candidate.cpuMs, one.wallMs, candidate.wallMs,
+               one.calls, candidate.calls, ratio);
+        ratios.push_back(ratio);
+    }
+    std::sort(ratios.begin(), ratios.end());
+    return ratios[ratios.size() / 2];
 }
 
-int main() {
+static int run_all() {
     printf("=== 两段式升频验证（44.1 kHz -> 705.6 kHz）===\n");
 
     ResamplerConfig base;
@@ -158,14 +211,26 @@ int main() {
     // 4) 运算量
     printf("\n--- 4. CPU 时间（0.1 秒音频 -> 705.6 kHz，单声道）---\n");
     {
-        double ms1 = 0.0, ms2 = 0.0;
-        run_bench(false, &ms1);
-        run_bench(true,  &ms2);
-        const double speedup = ms1 / std::max(1e-9, ms2);
-        printf("  单级 %.1f ms   两段 %.1f ms   加速 %.2fx\n", ms1, ms2, speedup);
+        const double cpuBefore = thread_cpu_ms();
+        const auto wallBefore = std::chrono::steady_clock::now();
+        std::this_thread::sleep_for(std::chrono::milliseconds(80));
+        const double waitWall = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - wallBefore).count();
+        check(thread_cpu_ms() - cpuBefore < waitWall * 0.5, "CPU clock excludes waiting");
+        const double speedup = bench_speedup(true, "two-stage");
         check(speedup > 1.5, "两段式明显更快", std::to_string(speedup) + "x");
+        const double control = bench_speedup(false, "same-implementation control");
+        check(!(control > 1.5), "same implementation cannot pass the speedup gate", std::to_string(control) + "x");
     }
 
     printf("\n%s (失败项 %d)\n", fails == 0 ? "全部通过" : "存在失败", fails);
     return fails == 0 ? 0 : 1;
+}
+
+int main() {
+    try { return run_all(); }
+    catch (const std::exception& e) {
+        std::fprintf(stderr, "[FAIL] two-stage measurement: %s\n", e.what());
+        return 1;
+    }
 }

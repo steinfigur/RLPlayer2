@@ -51,5 +51,38 @@
     },
     "windows_audio_checks": 1031
   },
-  "audio_count_note": "The failed-input seek case must terminate after three written frames; it no longer validates padding that must never be written."
+  "audio_count_note": "The failed-input seek case must terminate after three written frames; it no longer validates padding that must never be written.",
+  "performance_gate_followup": {
+    "failed_ci": "https://github.com/steinfigur/RLPlayer2/actions/runs/40920022196",
+    "failed_target": "two_stage",
+    "other_targets_passed": 118,
+    "original_threshold": ">1.5x",
+    "unchanged_production_resampler": true,
+    "measurement": "current-thread CPU time, warmup, >=250ms CPU per trial, five alternating pairs, median ratio",
+    "cpu_wait_calibration": "pass",
+    "same_implementation_control": "must not exceed the original 1.5x gate",
+    "three_local_runs": {
+      "speedup": [
+        3.25,
+        3.5,
+        3.6
+      ],
+      "control": [
+        0.755556,
+        1.0,
+        1.011905
+      ]
+    },
+    "final_ctest": {
+      "Total": 1,
+      "Skipped": 0,
+      "Failed": 0,
+      "InternalSkipOnly": 0,
+      "exit_code": 0,
+      "seconds": 9.06,
+      "speedup": 3.1875,
+      "control": 1.0
+    },
+    "clock_reference": "https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getthreadtimes"
+  }
 }
