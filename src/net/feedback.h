@@ -61,18 +61,7 @@
 //   * 任何 token 只在内存里过一手，绝不写进 payload / 日志 / 本地文件 / 返回值；
 //   * 网络失败不阻塞超过 totalBudgetMs（默认 14 s，其中 gh 取 token ≤ 2.5 s、HTTP ≤ 11 s）。
 #pragma once
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-
 #include "net/feedback_redaction.h"
-
-#include <windows.h>
-#include <psapi.h>
-#include <winhttp.h>
 
 #include <algorithm>
 #include <cctype>
@@ -90,15 +79,12 @@
 #include <utility>
 #include <vector>
 
-#include "crash_dump.h"          // rta::diag::os_version_string / cpu_brand / read_tester（复用，不重写）
 #include "net/json.h"            // 只读 JSON 解析（解析调用方给的片段 + GitHub 响应）
 #include "platform/path.h"       // module_dir_utf8 / join / from_utf8
 #include "platform/process.h"    // run_hidden（调 gh auth token）
+#include "platform/feedback_support.h"
+#include "platform/time.h"
 #include "version.h"
-
-#pragma comment(lib, "winhttp.lib")
-#pragma comment(lib, "psapi.lib")
-#pragma comment(lib, "user32.lib")
 
 namespace rta::feedback {
 
@@ -212,8 +198,8 @@ inline unsigned rnd32() {
     static unsigned long long st = 0;
     std::lock_guard<std::mutex> lk(mx);
     if (st == 0) {
-        st = (unsigned long long)GetTickCount64() * 6364136223846793005ULL +
-             (unsigned long long)GetCurrentProcessId() * 1442695040888963407ULL;
+        st = (unsigned long long)rta::platform::monotonic_ms() * 6364136223846793005ULL +
+             (unsigned long long)rta::platform::process_id() * 1442695040888963407ULL;
         if (st == 0) st = 88172645463325252ULL;
     }
     st ^= st << 13; st ^= st >> 7; st ^= st << 17;
@@ -222,20 +208,16 @@ inline unsigned rnd32() {
 
 inline Stamp make_stamp() {
     Stamp s;
-    SYSTEMTIME st;
-    GetLocalTime(&st);
+    const auto st = rta::platform::feedback_local_clock();
     char b[64];
-    std::snprintf(b, sizeof(b), "%04u%02u%02u-%02u%02u%02u", (unsigned)st.wYear, (unsigned)st.wMonth,
-                  (unsigned)st.wDay, (unsigned)st.wHour, (unsigned)st.wMinute, (unsigned)st.wSecond);
+    std::snprintf(b, sizeof(b), "%04u%02u%02u-%02u%02u%02u", (unsigned)st.year, (unsigned)st.month,
+                  (unsigned)st.day, (unsigned)st.hour, (unsigned)st.minute, (unsigned)st.second);
     char r[8];
     std::snprintf(r, sizeof(r), "%06x", rnd32() & 0xFFFFFFu);
     s.id = std::string(b) + "-" + r;
-    std::snprintf(b, sizeof(b), "%04u-%02u-%02uT%02u:%02u:%02u", (unsigned)st.wYear, (unsigned)st.wMonth,
-                  (unsigned)st.wDay, (unsigned)st.wHour, (unsigned)st.wMinute, (unsigned)st.wSecond);
-    TIME_ZONE_INFORMATION tzi{};
-    const DWORD tz = GetTimeZoneInformation(&tzi);
-    const long bias = tzi.Bias + (tz == TIME_ZONE_ID_DAYLIGHT ? tzi.DaylightBias : tzi.StandardBias);
-    const long east = -bias;                       // 分钟，东为正
+    std::snprintf(b, sizeof(b), "%04u-%02u-%02uT%02u:%02u:%02u", (unsigned)st.year, (unsigned)st.month,
+                  (unsigned)st.day, (unsigned)st.hour, (unsigned)st.minute, (unsigned)st.second);
+    const long east = st.eastMinutes;              // 分钟，东为正
     const long ah = east >= 0 ? east / 60 : -((-east) / 60);
     const long am = east >= 0 ? (east % 60) : -((-east) % 60);
     char tzb[16];
@@ -248,59 +230,27 @@ inline Stamp make_stamp() {
 inline std::string exe_dir() { return rta::platform::module_dir_utf8(); }
 
 inline void collect_gpu_adapters(std::string& out) {
-    std::vector<std::string> names;
-    for (DWORD i = 0; i < 8; ++i) {
-        DISPLAY_DEVICEW dd{};
-        dd.cb = sizeof(dd);
-        if (!EnumDisplayDevicesW(nullptr, i, &dd, 0)) break;
-        if (!(dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP)) continue;
-        char u8[256] = {0};
-        WideCharToMultiByte(CP_UTF8, 0, dd.DeviceString, -1, u8, (int)sizeof(u8) - 1, nullptr, nullptr);
-        const std::string n(u8);
-        if (n.empty()) continue;
-        if (std::find(names.begin(), names.end(), n) == names.end()) names.push_back(n);
-    }
+    const auto names = rta::platform::desktop_display_names();
     out.clear();
     for (size_t i = 0; i < names.size(); ++i) { if (i) out += " / "; out += names[i]; }
 }
 
-// 进程已运行秒数。
-// 坑：GetProcessTimes 的 lpExitTime 对**仍在运行**的进程不可用（实测拿到 0），
-// 拿它减低 64 位会回绕成 1.8e12 秒。所以改成"现在（FILETIME 时基）- 创建时间"。
-inline unsigned long long proc_uptime_sec() {
-    FILETIME c, e, k, u;
-    if (!GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u)) return 0;
-    FILETIME now;
-    GetSystemTimeAsFileTime(&now);
-    ULARGE_INTEGER cur, born;
-    cur.LowPart = now.dwLowDateTime; cur.HighPart = now.dwHighDateTime;
-    born.LowPart = c.dwLowDateTime;  born.HighPart = c.dwHighDateTime;
-    if (cur.QuadPart <= born.QuadPart) return 0;
-    return (unsigned long long)((cur.QuadPart - born.QuadPart) / 10000000ULL);
-}
+inline unsigned long long proc_uptime_sec() { return rta::platform::process_uptime_seconds(); }
+using MemInfo = rta::platform::FeedbackMemoryInfo;
+inline MemInfo mem_info() { return rta::platform::feedback_memory_info(); }
 
-struct MemInfo {
-    unsigned long long wsMb = 0, peakMb = 0, privMb = 0, ramTotalMb = 0, ramAvailMb = 0;
-    unsigned handles = 0;
-};
-
-inline MemInfo mem_info() {
-    MemInfo m;
-    PROCESS_MEMORY_COUNTERS_EX pmc{};
-    if (GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*)&pmc, sizeof(pmc))) {
-        m.wsMb   = (unsigned long long)pmc.WorkingSetSize / (1024ull * 1024ull);
-        m.peakMb = (unsigned long long)pmc.PeakWorkingSetSize / (1024ull * 1024ull);
-        m.privMb = (unsigned long long)pmc.PrivateUsage / (1024ull * 1024ull);
+// Tester identity is an application file, not an operating-system observation.
+inline std::string read_tester() {
+    std::ifstream f(rta::platform::from_utf8(rta::platform::join(exe_dir(), "rlplayer-tester.txt")));
+    std::string line;
+    while (std::getline(f, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        const size_t a = line.find_first_not_of(" \t");
+        if (a == std::string::npos) continue;
+        const size_t b = line.find_last_not_of(" \t");
+        return line.substr(a, b - a + 1);
     }
-    DWORD h = 0;
-    if (GetProcessHandleCount(GetCurrentProcess(), &h)) m.handles = (unsigned)h;
-    MEMORYSTATUSEX ms{};
-    ms.dwLength = sizeof(ms);
-    if (GlobalMemoryStatusEx(&ms)) {
-        m.ramTotalMb = (unsigned long long)ms.ullTotalPhys / (1024ull * 1024ull);
-        m.ramAvailMb = (unsigned long long)ms.ullAvailPhys / (1024ull * 1024ull);
-    }
-    return m;
+    return "";
 }
 
 // 读文件尾巴：最多 maxLines 行、最多 maxBytes 字节（先按字节截，再按行截）
@@ -382,19 +332,10 @@ inline bool looks_like_token(const std::string& t) {
     return true;
 }
 
-// 走 GetEnvironmentVariableW 而不是 std::getenv：后者在 MSVC/clang-cl 上是 deprecated，
-// 而且只看得懂 ANSI 代码页。token 是纯 ASCII，但统一走宽 API 更省事。
+// Read UTF-8 environment values through the platform boundary; selection and validation stay here.
 inline std::string token_from_env() {
-    const wchar_t* names[2] = {L"GITHUB_TOKEN", L"RLPLAYER_GH_TOKEN"};
-    for (const wchar_t* k : names) {
-        wchar_t buf[1024];
-        const DWORD n = ::GetEnvironmentVariableW(k, buf, 1024);
-        if (n == 0 || n >= 1024) continue;
-        const int m = ::WideCharToMultiByte(CP_UTF8, 0, buf, (int)n, nullptr, 0, nullptr, nullptr);
-        if (m <= 0) continue;
-        std::string t((size_t)m, '\0');
-        ::WideCharToMultiByte(CP_UTF8, 0, buf, (int)n, t.data(), m, nullptr, nullptr);
-        t = strip_trim(t);
+    for (const char* name : {"GITHUB_TOKEN", "RLPLAYER_GH_TOKEN"}) {
+        const std::string t = strip_trim(rta::platform::feedback_environment_value(name));
         if (looks_like_token(t)) return t;
     }
     return "";
@@ -490,195 +431,21 @@ inline TokenPick pick_token(const Options& opt) {
 // ---------------------------------------------------------------------------
 // GitHub Contents API PUT
 //
-// 为什么要自己走 WinHTTP：平台层 src/platform/http.h 的 method 只有 GET/POST 两档
-// （那是另一个文件的契约，本工作包不改它），而 /contents 只接受 PUT。
-// 预算：先试系统代理（AUTOMATIC_PROXY），失败再试直连；两次共享 opt.timeoutMs。
+// The transport boundary preserves PUT/POST, automatic/direct/named proxy modes and
+// the existing per-operation timeout; retry and total-budget decisions remain here.
 // ---------------------------------------------------------------------------
-struct PutResult {
-    bool ok = false;
-    int  status = 0;
-    std::string error;     // 人话
-    std::string body;
-};
+using PutResult = rta::platform::FeedbackHttpResult;
 
-inline std::string winhttp_reason(DWORD e) {
-    switch (e) {
-        case 12001: return "内存/缓冲区不足";
-        case 12002: return "请求超时（网络太慢或被墙）";
-        case 12005: return "URL 不合法";
-        case 12006: return "网络不可用";
-        case 12007: return "无法解析主机名（DNS 失败，检查网络）";
-        case 12008: return "代理或服务器地址被拒绝";
-        case 12017: return "操作被取消";
-        case 12019: return "连接被服务器断开";
-        case 12029: return "无法连接服务器（防火墙/代理/断网）";
-        case 12030: return "连接被拒绝或中断";
-        case 12152: return "服务器返回了无法解析的响应";
-        case 12175: return "TLS/证书校验失败";
-        default:     return "WinHTTP 错误 " + std::to_string((unsigned long)e);
-    }
-}
-
-struct UrlParts {
-    bool https = false;
-    std::wstring host;
-    int port = 0;
-    std::wstring path;
-    bool valid = false;
-};
-
-inline std::wstring utf8_to_wide(const std::string& s) {
-    const int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
-    if (n <= 0) return std::wstring();
-    std::wstring w((size_t)n, L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), w.data(), n);
-    return w;
-}
-
-inline UrlParts parse_url(const std::string& url) {
-    UrlParts u;
-    size_t p = 0;
-    if (url.rfind("https://", 0) == 0) { u.https = true; p = 8; }
-    else if (url.rfind("http://", 0) == 0) { u.https = false; p = 7; }
-    else return u;
-    const size_t slash = url.find('/', p);
-    const std::string hp = (slash == std::string::npos) ? url.substr(p) : url.substr(p, slash - p);
-    const std::string path = (slash == std::string::npos) ? "/" : url.substr(slash);
-    std::string host = hp;
-    int port = u.https ? 443 : 80;
-    const size_t colon = hp.rfind(':');
-    if (colon != std::string::npos) {
-        host = hp.substr(0, colon);
-        port = std::atoi(hp.c_str() + colon + 1);
-    }
-    if (host.empty() || port <= 0) return u;
-    u.host = utf8_to_wide(host);
-    u.path = utf8_to_wide(path);
-    u.port = port;
-    u.valid = !u.host.empty() && !u.path.empty();
-    return u;
-}
-
-// proxyMode: 0 = 自动（系统代理）、1 = 直连、2 = 具名代理
 inline PutResult http_put_once(const std::string& url, const std::vector<std::string>& headers,
                                const std::string& body, int timeoutMs, int proxyMode,
                                const std::string& proxy) {
-    PutResult r;
-    const UrlParts u = parse_url(url);
-    if (!u.valid) { r.error = "URL 解析失败"; return r; }
-
-    const std::wstring wproxy = (proxyMode == 2) ? utf8_to_wide(proxy) : std::wstring();
-    const DWORD access = (proxyMode == 1) ? WINHTTP_ACCESS_TYPE_NO_PROXY
-                       : (proxyMode == 2) ? WINHTTP_ACCESS_TYPE_NAMED_PROXY
-                                          : WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY;
-    HINTERNET ses = ::WinHttpOpen(L"RLPlayer-feedback/1.0", access,
-                                  (proxyMode == 2) ? wproxy.c_str() : WINHTTP_NO_PROXY_NAME,
-                                  WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!ses) { r.error = winhttp_reason(::GetLastError()); return r; }
-    ::WinHttpSetTimeouts(ses, timeoutMs, timeoutMs, timeoutMs, timeoutMs);
-
-    HINTERNET con = ::WinHttpConnect(ses, u.host.c_str(), (INTERNET_PORT)u.port, 0);
-    if (!con) { r.error = winhttp_reason(::GetLastError()); ::WinHttpCloseHandle(ses); return r; }
-
-    HINTERNET hreq = ::WinHttpOpenRequest(con, L"PUT", u.path.c_str(), nullptr, WINHTTP_NO_REFERER,
-                                          WINHTTP_DEFAULT_ACCEPT_TYPES,
-                                          u.https ? WINHTTP_FLAG_SECURE : 0);
-    if (!hreq) {
-        r.error = winhttp_reason(::GetLastError());
-        ::WinHttpCloseHandle(con); ::WinHttpCloseHandle(ses);
-        return r;
-    }
-    for (const auto& h : headers) {
-        const std::wstring w = utf8_to_wide(h);
-        if (!w.empty()) ::WinHttpAddRequestHeaders(hreq, w.c_str(), (DWORD)-1L, WINHTTP_ADDREQ_FLAG_ADD);
-    }
-    const bool sent = ::WinHttpSendRequest(hreq, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-                                           (LPVOID)body.data(), (DWORD)body.size(),
-                                           (DWORD)body.size(), 0) != 0 &&
-                      ::WinHttpReceiveResponse(hreq, nullptr) != 0;
-    if (!sent) {
-        r.error = winhttp_reason(::GetLastError());
-        ::WinHttpCloseHandle(hreq); ::WinHttpCloseHandle(con); ::WinHttpCloseHandle(ses);
-        return r;
-    }
-    DWORD code = 0, len = sizeof(code);
-    ::WinHttpQueryHeaders(hreq, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                          WINHTTP_HEADER_NAME_BY_INDEX, &code, &len, WINHTTP_NO_HEADER_INDEX);
-    r.status = (int)code;
-    for (;;) {
-        DWORD avail = 0;
-        if (!::WinHttpQueryDataAvailable(hreq, &avail) || avail == 0) break;
-        std::vector<char> buf((size_t)avail);
-        DWORD got = 0;
-        if (!::WinHttpReadData(hreq, buf.data(), avail, &got) || got == 0) break;
-        r.body.append(buf.data(), (size_t)got);
-    }
-    ::WinHttpCloseHandle(hreq); ::WinHttpCloseHandle(con); ::WinHttpCloseHandle(ses);
-    r.ok = (r.status >= 200 && r.status < 300);
-    if (!r.ok && r.error.empty()) r.error = "HTTP " + std::to_string(r.status);
-    return r;
+    return rta::platform::feedback_http_request("PUT", url, headers, body, timeoutMs, proxyMode, proxy);
 }
 
-// 2026-10-27（2.0 前，用户钦定）：POST 版。
-//   Worker 只接受 POST，而上面那个函数写死了 L"PUT"。复制一份而不是加参数：
-//   http_put_once 被多处与测试引用，改签名会牵连；这里只多 60 行，风险更低。
 inline PutResult http_post_once(const std::string& url, const std::vector<std::string>& headers,
                                 const std::string& body, int timeoutMs, int proxyMode,
                                 const std::string& proxy) {
-  PutResult r;
-  const UrlParts u = parse_url(url);
-  if (!u.valid) { r.error = "URL 解析失败"; return r; }
-
-  const std::wstring wproxy = (proxyMode == 2) ? utf8_to_wide(proxy) : std::wstring();
-  const DWORD access = (proxyMode == 1) ? WINHTTP_ACCESS_TYPE_NO_PROXY
-                      : (proxyMode == 2) ? WINHTTP_ACCESS_TYPE_NAMED_PROXY
-                                         : WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY;
-  HINTERNET ses = ::WinHttpOpen(L"RLPlayer-feedback/1.0", access,
-                                (proxyMode == 2) ? wproxy.c_str() : WINHTTP_NO_PROXY_NAME,
-                                WINHTTP_NO_PROXY_BYPASS, 0);
-  if (!ses) { r.error = winhttp_reason(::GetLastError()); return r; }
-  ::WinHttpSetTimeouts(ses, timeoutMs, timeoutMs, timeoutMs, timeoutMs);
-
-  HINTERNET con = ::WinHttpConnect(ses, u.host.c_str(), (INTERNET_PORT)u.port, 0);
-  if (!con) { r.error = winhttp_reason(::GetLastError()); ::WinHttpCloseHandle(ses); return r; }
-
-  HINTERNET hreq = ::WinHttpOpenRequest(con, L"POST", u.path.c_str(), nullptr, WINHTTP_NO_REFERER,
-                                        WINHTTP_DEFAULT_ACCEPT_TYPES,
-                                        u.https ? WINHTTP_FLAG_SECURE : 0);
-  if (!hreq) {
-    r.error = winhttp_reason(::GetLastError());
-    ::WinHttpCloseHandle(con); ::WinHttpCloseHandle(ses);
-    return r;
-  }
-  for (const auto& h : headers) {
-    const std::wstring w = utf8_to_wide(h);
-    if (!w.empty()) ::WinHttpAddRequestHeaders(hreq, w.c_str(), (DWORD)-1L, WINHTTP_ADDREQ_FLAG_ADD);
-  }
-  const bool sent = ::WinHttpSendRequest(hreq, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-                                         (LPVOID)body.data(), (DWORD)body.size(),
-                                         (DWORD)body.size(), 0) != 0 &&
-                    ::WinHttpReceiveResponse(hreq, nullptr) != 0;
-  if (!sent) {
-    r.error = winhttp_reason(::GetLastError());
-    ::WinHttpCloseHandle(hreq); ::WinHttpCloseHandle(con); ::WinHttpCloseHandle(ses);
-    return r;
-  }
-  DWORD code = 0, len = sizeof(code);
-  ::WinHttpQueryHeaders(hreq, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                        WINHTTP_HEADER_NAME_BY_INDEX, &code, &len, WINHTTP_NO_HEADER_INDEX);
-  r.status = (int)code;
-  for (;;) {
-    DWORD avail = 0;
-    if (!::WinHttpQueryDataAvailable(hreq, &avail) || avail == 0) break;
-    std::vector<char> buf((size_t)avail);
-    DWORD got = 0;
-    if (!::WinHttpReadData(hreq, buf.data(), avail, &got) || got == 0) break;
-    r.body.append(buf.data(), (size_t)got);
-  }
-  ::WinHttpCloseHandle(hreq); ::WinHttpCloseHandle(con); ::WinHttpCloseHandle(ses);
-  r.ok = (r.status >= 200 && r.status < 300);
-  if (!r.ok && r.error.empty()) r.error = "HTTP " + std::to_string(r.status);
-  return r;
+    return rta::platform::feedback_http_request("POST", url, headers, body, timeoutMs, proxyMode, proxy);
 }
 
 inline std::string http_status_hint(int st) {
@@ -750,7 +517,7 @@ inline Payload build_payload(const UserReport& u, const LiveState& live, const O
     o += ",\"version\":" + jq(std::string(RLPLAYER_VERSION));
     o += ",\"build\":" + jq(std::string(__DATE__) + " " + __TIME__);
     o += ",\"source\":" + jq(live.source.empty() ? "unknown" : live.source);
-    o += ",\"tester\":" + jq(rta::diag::read_tester());
+    o += ",\"tester\":" + jq(read_tester());
     o += ",\"arch\":" + jq(sizeof(void*) == 8 ? "x64" : "x86");
     o += "}";
 
@@ -763,11 +530,9 @@ inline Payload build_payload(const UserReport& u, const LiveState& live, const O
     o += "}";
 
     o += ",\"system\":{";
-    o += "\"os\":" + jq(rta::diag::os_version_string());
-    o += ",\"cpu\":" + jq(rta::diag::cpu_brand());
-    SYSTEM_INFO si{};
-    GetSystemInfo(&si);
-    o += ",\"cpu_threads\":" + std::to_string((unsigned long long)si.dwNumberOfProcessors);
+    o += "\"os\":" + jq(rta::platform::host_os_description());
+    o += ",\"cpu\":" + jq(rta::platform::processor_brand());
+    o += ",\"cpu_threads\":" + std::to_string(rta::platform::processor_count());
     o += ",\"gpu\":" + jq(gpu);
     o += ",\"ram_total_mb\":" + std::to_string(mi.ramTotalMb);
     o += ",\"ram_avail_mb\":" + std::to_string(mi.ramAvailMb);
@@ -775,7 +540,7 @@ inline Payload build_payload(const UserReport& u, const LiveState& live, const O
     o += "}";
 
     o += ",\"process\":{";
-    o += "\"pid\":" + std::to_string((unsigned long long)GetCurrentProcessId());
+    o += "\"pid\":" + std::to_string((unsigned long long)rta::platform::process_id());
     o += ",\"uptime_sec\":" + std::to_string(proc_uptime_sec());
     o += ",\"mem_working_set_mb\":" + std::to_string(mi.wsMb);
     o += ",\"mem_peak_mb\":" + std::to_string(mi.peakMb);
@@ -877,7 +642,7 @@ inline std::string outbox_write(const std::string& id, const std::string& json,
 // ---------------------------------------------------------------------------
 inline Result submit(const UserReport& u, const LiveState& live, const Options& opt) {
     Result r;
-    const ULONGLONG t0 = GetTickCount64();
+    const auto t0 = rta::platform::monotonic_ms();
     const Payload pl = build_payload(u, live, opt);
     r.id = pl.id;
     r.json = pl.json;
@@ -886,13 +651,13 @@ inline Result submit(const UserReport& u, const LiveState& live, const Options& 
 
     if (opt.dryRun) {
         r.message = "dry-run：只生成 JSON，未上传";
-        r.elapsedMs = (long long)(GetTickCount64() - t0);
+        r.elapsedMs = (long long)(rta::platform::monotonic_ms() - t0);
         return r;
     }
     if (u.title.empty() && u.body.empty()) {
         r.error = "标题和正文不能都为空";
         r.message = r.error;
-        r.elapsedMs = (long long)(GetTickCount64() - t0);
+        r.elapsedMs = (long long)(rta::platform::monotonic_ms() - t0);
         return r;
     }
 
@@ -913,7 +678,7 @@ inline Result submit(const UserReport& u, const LiveState& live, const Options& 
             r.message = r.localPath.empty()
                 ? (r.error + "；本地兜底也没写成，请检查 exe 目录是否可写")
                 : ("没上传成功（" + r.error + "）。反馈已保存到本地：" + r.localPath);
-            r.elapsedMs = (long long)(GetTickCount64() - t0);
+            r.elapsedMs = (long long)(rta::platform::monotonic_ms() - t0);
             return r;
         }
         // Worker 回 {"ok":true,"id":"FB-20261027-XXXXX","issue":12}
@@ -927,7 +692,7 @@ inline Result submit(const UserReport& u, const LiveState& live, const Options& 
             ? ("已提交，感谢反馈！工单 " + r.id + "（issue #" + std::to_string(wissue) + "）")
             : ("已提交，感谢反馈！工单 " + r.id);
         if (opt.keepLocalCopy) r.localPath = outbox_write(pl.id, pl.json, opt.outboxDir);
-        r.elapsedMs = (long long)(GetTickCount64() - t0);
+        r.elapsedMs = (long long)(rta::platform::monotonic_ms() - t0);
         return r;
     }
 
@@ -941,7 +706,7 @@ inline Result submit(const UserReport& u, const LiveState& live, const Options& 
         r.message = r.localPath.empty()
             ? (r.error + "；本地兜底也没写成，请检查 exe 目录是否可写")
             : ("没上传（缺凭据）。反馈已保存到本地：" + r.localPath);
-        r.elapsedMs = (long long)(GetTickCount64() - t0);
+        r.elapsedMs = (long long)(rta::platform::monotonic_ms() - t0);
         return r;
     }
 
@@ -976,7 +741,7 @@ inline Result submit(const UserReport& u, const LiveState& live, const Options& 
     int mode = 2;
     if (opt.proxy.empty()) mode = 0;
     else if (opt.proxy == "none") mode = 1;
-    const long long spentMs = (long long)(GetTickCount64() - t0);
+    const long long spentMs = (long long)(rta::platform::monotonic_ms() - t0);
     const long long leftMs = (long long)opt.totalBudgetMs - spentMs;
     const int perTry = (int)std::max<long long>(3000, std::min<long long>(opt.timeoutMs, leftMs) / 2);
     PutResult pr = http_put_once(url, hdrs, body, perTry, mode, opt.proxy);
@@ -996,7 +761,7 @@ inline Result submit(const UserReport& u, const LiveState& live, const Options& 
         r.message = r.localPath.empty()
             ? (r.error + "；本地兜底也没写成，请检查 exe 目录是否可写")
             : ("没上传成功（" + r.error + "）。反馈已保存到本地：" + r.localPath);
-        r.elapsedMs = (long long)(GetTickCount64() - t0);
+        r.elapsedMs = (long long)(rta::platform::monotonic_ms() - t0);
         return r;
     }
 
@@ -1013,7 +778,7 @@ inline Result submit(const UserReport& u, const LiveState& live, const Options& 
     r.uploaded = true;
     r.message = "已上传，感谢反馈！文件：" + r.remotePath;
     if (opt.keepLocalCopy) r.localPath = outbox_write(pl.id, pl.json, opt.outboxDir);
-    r.elapsedMs = (long long)(GetTickCount64() - t0);
+    r.elapsedMs = (long long)(rta::platform::monotonic_ms() - t0);
     return r;
 }
 

@@ -2,7 +2,7 @@
 
 > 读者：**Mac 组**（要用 CoreAudio / NSURLSession / posix_spawn 重做输出与传输）、
 > 本项目后续维护者（要判断"这行代码该放哪一层"）。
-> 状态：Windows 侧**已落地并全绿**（构建 0 error、ctest 45/45、边界门禁退出码 0）；
+> 状态：Windows 侧已落地；当前构建、CTest数量与范围见[审查验收记录](docs/review-fixes.md)。
 > Mac 侧**尚未实现**（平台头文件在非 Windows 上是 `#error`，见 §9）。
 >
 > 一句话：`src/platform/` 是内核与操作系统之间**唯一**的接缝。内核目录里出现
@@ -185,6 +185,17 @@ tools/platform_boundary_allowlist.txt    # 例外清单：路径|原因|清理�
 
 见 §4（映射）、§5（bit-perfect）、§7（错误）、§8（缓冲）。
 
+### 3.10 文本、环境与诊断/更新原生操作
+
+| 契约 | 原生职责与边界 |
+|---|---|
+| `platform/text.h` | 显式长度UTF-8/UTF-16转换、CP936严格后宽松解码；保留替换与嵌入NUL语义。CUE/标签编码选择仍在meta。 |
+| `platform/environment.h` | 有限宽缓冲环境读取，返回复制长度或所需容量；开关的空白、大小写和超长处理仍在meta。 |
+| `platform/feedback_support.h` | 只读主机/进程观察、当地时间、单次HTTP传输；反馈JSON、脱敏、凭据、预算重试和上传编排仍在net。 |
+| `platform/update_support.h` | 不透明文件lease、持久重命名、原生属性/进程路径检查、系统工具路径与launcher退出消息；版本、暂存清单、台账、回滚和写者归属仍在net。 |
+
+实现均在`platform/windows/`，未提供的平台继续显式拒绝构建。原边界扫描器和3条socket白名单保持不变。编码/环境语义由`audit_meta_platform`回归覆盖，更新锁与事务、反馈脱敏继续使用正式实现的离线故障测试；范围见[验收记录](docs/review-fixes.md)。
+
 ---
 
 ## 4. 音频输出：契约 ↔ 现状（Windows）
@@ -354,6 +365,7 @@ Windows 现状与它一致的关键点：`rate_pick.h` 的"保持源采样率"�
    `window.webkit.messageHandlers.*.postMessage` + 注入 `window.chrome.webview` 垫片），
    消息名与语义**逐字**照 §10。
 10. **宿主要做的两件小事**：启动时 `setBaseDir`（§6.2）、把日志接到 `LogHooks`（§3.8）。
+11. **补充原生接口**（§3.10）：实现文本/CP936、有限缓冲环境读取、反馈系统观察与单次传输、更新lease/持久替换/进程路径检查；不得把缺实现伪装为成功或无进程占用。
 
 验收（Mac 侧自测，不许"看能响"就算）：
 - `decide_route` 的 6 个分支各跑一遍（纯函数，不需要声卡）；

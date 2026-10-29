@@ -12,6 +12,7 @@
 // 不打开任何音频设备（铁律 1）。夹具落在当前工作目录的 test_health_robust_tmp\，跑完即删。
 #include "analysis/track_health.h"
 #include "analysis/health_stream.h"
+#include "net/json.h"
 
 #include <windows.h>
 #include <algorithm>
@@ -285,8 +286,16 @@ static int run_all() {
         check(js.find("no\"such") == std::string::npos, "错误信息里没有未转义的裸引号");
         check(js.find("\tfile") == std::string::npos || js.find("\\tfile") != std::string::npos,
               "错误信息里的制表符已转义成 \\t");
-        // 反斜杠：Windows 路径天然带 \，必须成对转义（否则 JSON 解析器会吃掉下一个字符）
-        check(js.find("D:\\\\") != std::string::npos || js.find("D:\\\\RTA") != std::string::npos,
+        // TEMP may be on any drive. Verify the actual error roundtrip, then
+        // exercise backslashes explicitly without assuming the host's drive letter.
+        const auto parsed = rta::net::json_parse(js);
+        check(parsed.type == rta::net::Json::Obj && parsed["error"].s() == e.error,
+              "实际路径错误信息 JSON 往返逐字一致");
+        TrackHealth slash = e;
+        slash.error = R"(C:\rta\file.wav)";
+        const std::string slashJson = stable(slash);
+        check(slashJson.find(R"(C:\\rta\\file.wav)") != std::string::npos &&
+              rta::net::json_parse(slashJson)["error"].s() == slash.error,
               "路径反斜杠已转义成双反斜杠");
         // 合法但少见的文件名：单引号 / 方括号
         const fsx::path p = g_dir / "a'b[1].wav";

@@ -17,6 +17,7 @@
 #include "audio/audio_loader.h"
 #include "audio/media_info.h"
 #include "net/scan_pool.h"
+#include "platform/fs.h"
 #include "meta/entities.h"
 #include "meta/cue.h"          // CUE 整轨分轨解析（仅头文件；library 侧把它变成虚拟曲目）
 #include "meta/tags_native.h"   // 原生标签快速通道（FLAC/WAV/MP3/OGG；lib_probe_one 的原生分支）
@@ -554,7 +555,7 @@ inline std::vector<unsigned char> lib_cover_embedded_bytes(const std::string& fi
         std::ifstream f(fsx::u8path(tmp), std::ios::binary);
         if (f) bytes.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
     }
-    DeleteFileW(rta::audio::widen(tmp).c_str());
+    rta::platform::remove_file(std::filesystem::u8path(tmp));
     if (bytes.size() <= 64) { bytes.clear(); return bytes; }      // 空/占位：当作没有
     // -c:v copy 下扩展名不可信，按文件头判真实 mime（与 media_info.h 同一口径）
     if (bytes.size() > 8 && bytes[0] == 0x89 && bytes[1] == 0x50 && bytes[2] == 0x4E && bytes[3] == 0x47) outMime = "image/png";

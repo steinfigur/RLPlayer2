@@ -42,5 +42,24 @@
     "full release packaging"
   ],
   "remote_gate": "https://github.com/steinfigur/RLPlayer2/actions/workflows/ci.yml",
-  "evidence_directory": "../review-fixes (outside source repository)"
+  "evidence_directory": "../review-fixes (outside source repository)",
+  "platform_and_ci_followup": {
+    "baseline_platform_violations": 119,
+    "first_fix_platform_violations": 133,
+    "final_platform_violations": 0,
+    "allowlist_changed": false,
+    "platform_gate_exit_code": 0,
+    "final_clang_build_exit_code": 0,
+    "related_ctest": {
+      "Total": 14,
+      "Skipped": 0,
+      "Failed": 0,
+      "InternalSkipOnly": 0
+    },
+    "related_ctest_exit_code": 0,
+    "related_ctest_seconds": 63.09,
+    "meta_semantic_checks": 98,
+    "first_remote_ci": "https://github.com/steinfigur/RLPlayer2/actions/runs/40906531260",
+    "first_remote_ci_result": "115/116 passed; health_robust assumed D: while runner TEMP used C:; fixed with actual error roundtrip and explicit backslash case"
+  }
 }

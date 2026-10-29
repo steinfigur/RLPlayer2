@@ -32,14 +32,6 @@
 //   3) 校验：sha256 + size 双闸门，不过就丢弃（verify_downloaded_file）
 //   4) 解压后逐文件再验一次 sha256（防 zip 内文件被换）
 #pragma once
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -62,6 +54,9 @@
 #include "net/update_staging.h"   // 完整暂存契约，复用 update_check.h 的版本/SHA 语义
 #include "platform/http.h"        // onChunk + discardBody（边下边写盘）
 #include "platform/path.h"
+#include "platform/fs.h"
+#include "platform/time.h"
+#include "platform/update_support.h"
 #include "platform/process.h"     // run_hidden（tar 解压）
 
 namespace rta::update {
@@ -104,24 +99,22 @@ inline std::string join_path(const std::string& a, const std::string& b) {
     return a + "\\" + b;
 }
 inline bool path_exists(const std::string& p) {
-    return ::GetFileAttributesW(rta::platform::from_utf8(p).c_str()) != INVALID_FILE_ATTRIBUTES;
+    return rta::platform::file_exists(rta::platform::from_utf8(p));
 }
 inline bool is_dir(const std::string& p) {
-    const DWORD a = ::GetFileAttributesW(rta::platform::from_utf8(p).c_str());
-    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    std::error_code ec;
+    return std::filesystem::is_directory(rta::platform::from_utf8(p), ec);
 }
 inline long long file_size(const std::string& p) {
-    WIN32_FILE_ATTRIBUTE_DATA d{};
-    if (!::GetFileAttributesExW(rta::platform::from_utf8(p).c_str(), GetFileExInfoStandard, &d))
-        return -1;
-    return ((long long)d.nFileSizeHigh << 32) | (long long)d.nFileSizeLow;
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(rta::platform::from_utf8(p), ec);
+    return ec ? -1 : (long long)size;
 }
 inline bool ensure_dir(const std::string& p) {
     if (p.empty()) return false;
     if (is_dir(p)) return true;
-    const size_t s = p.find_last_of("\\/");
-    if (s != std::string::npos && s > 0) ensure_dir(p.substr(0, s));
-    ::CreateDirectoryW(rta::platform::from_utf8(p).c_str(), nullptr);
+    std::error_code ec;
+    std::filesystem::create_directories(rta::platform::from_utf8(p), ec);
     return is_dir(p);
 }
 inline std::string read_text_file(const std::string& p) {
@@ -144,46 +137,37 @@ inline std::string lower_ascii(std::string s) {
 }
 
 inline bool rmtree(const std::string& dir) {
+    const auto path = rta::platform::from_utf8(dir);
     if (!is_dir(dir)) {
         if (path_exists(dir)) {
-            ::SetFileAttributesW(rta::platform::from_utf8(dir).c_str(), FILE_ATTRIBUTE_NORMAL);
-            return ::DeleteFileW(rta::platform::from_utf8(dir).c_str()) != 0;
+            rta::platform::reset_file_attributes(path);
+            return rta::platform::remove_file(path);
         }
         return true;
     }
-    WIN32_FIND_DATAW fd{};
-    HANDLE h = ::FindFirstFileW(rta::platform::from_utf8(join_path(dir, "*")).c_str(), &fd);
-    if (h != INVALID_HANDLE_VALUE) {
-        do {
-            const std::wstring nm(fd.cFileName);
-            if (nm == L"." || nm == L"..") continue;
-            const std::string full = join_path(dir, rta::platform::detail::narrow(nm));
-            if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) rmtree(full);
-            else {
-                ::SetFileAttributesW(rta::platform::from_utf8(full).c_str(), FILE_ATTRIBUTE_NORMAL);
-                ::DeleteFileW(rta::platform::from_utf8(full).c_str());
-            }
-        } while (::FindNextFileW(h, &fd));
-        ::FindClose(h);
+    std::error_code ec;
+    for (std::filesystem::directory_iterator it(path, ec), end; !ec && it != end; it.increment(ec)) {
+        const auto child = it->path();
+        if (it->is_directory(ec)) rmtree(rta::platform::to_utf8(child));
+        else {
+            rta::platform::reset_file_attributes(child);
+            rta::platform::remove_file(child);
+        }
     }
-    return ::RemoveDirectoryW(rta::platform::from_utf8(dir).c_str()) != 0;
+    return std::filesystem::remove(path, ec);
 }
 
 inline void list_files_rel(const std::string& root, const std::string& rel,
                            std::vector<std::string>& out) {
-    WIN32_FIND_DATAW fd{};
     const std::string dir = rel.empty() ? root : join_path(root, rel);
-    HANDLE h = ::FindFirstFileW(rta::platform::from_utf8(join_path(dir, "*")).c_str(), &fd);
-    if (h == INVALID_HANDLE_VALUE) return;
-    do {
-        const std::wstring nm(fd.cFileName);
-        if (nm == L"." || nm == L"..") continue;
-        const std::string name = rta::platform::detail::narrow(nm);
-        const std::string childRel = rel.empty() ? name : (rel + "\\" + name);
-        if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) list_files_rel(root, childRel, out);
+    std::error_code ec;
+    for (std::filesystem::directory_iterator it(rta::platform::from_utf8(dir), ec), end;
+         !ec && it != end; it.increment(ec)) {
+        const std::string name = rta::platform::to_utf8(it->path().filename());
+        const std::string childRel = rel.empty() ? name : rel + "\\" + name;
+        if (it->is_directory(ec)) list_files_rel(root, childRel, out);
         else out.push_back(childRel);
-    } while (::FindNextFileW(h, &fd));
-    ::FindClose(h);
+    }
 }
 
 inline int count_files(const std::string& dir, int cap = 100000) {
@@ -197,15 +181,7 @@ inline std::string version_dir(const std::string& v) { return join_path(updates_
 inline std::string delta_name(const std::string& v) { return "RLPlayer-" + v + "-delta.zip"; }
 inline std::string full_name(const std::string& v) { return "RLPlayer-" + v + "-win64.zip"; }
 
-inline std::string tar_exe() {
-    wchar_t sys[MAX_PATH] = {0};
-    const UINT n = ::GetSystemDirectoryW(sys, MAX_PATH);
-    if (n > 0) {
-        const std::string p = rta::platform::detail::narrow(std::wstring(sys, n)) + "\\tar.exe";
-        if (path_exists(p)) return p;
-    }
-    return "tar.exe";
-}
+inline std::string tar_exe() { return rta::platform::system_tool_path("tar.exe"); }
 
 // ---------------------------------------------------------------------------
 // 2. 配置（rlplayer-update.conf）：跳过版本 / 清单地址
@@ -345,12 +321,13 @@ public:
         } else {
             if (!ensure_dir(updates_root())) { err = "无法创建更新写锁目录"; return; }
             held.path = path;
-            held.handle = ::CreateFileW(rta::platform::from_utf8(path).c_str(), GENERIC_READ | GENERIC_WRITE,
-                0, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-            if (held.handle == INVALID_HANDLE_VALUE) {
-                const DWORD code = ::GetLastError(); held.path.clear();
-                err = (code == ERROR_SHARING_VIOLATION || code == ERROR_LOCK_VIOLATION)
-                    ? "另一进程正在使用更新文件，请稍后重试"
+            held.lease = std::make_unique<rta::platform::FileLease>(rta::platform::from_utf8(path),
+                rta::platform::FileLeaseMode::WriterExclusive);
+            if (!held.lease->ok()) {
+                const int code = held.lease->error_code();
+                const bool busy = held.lease->contended();
+                held.path.clear(); held.lease.reset();
+                err = busy ? "另一进程正在使用更新文件，请稍后重试"
                     : "无法获取更新写锁（Windows 错误 " + std::to_string(code) + "）";
                 return;
             }
@@ -360,13 +337,13 @@ public:
     ~UpdateWriterLease() {
         if (!owns_) return;
         auto& held = current();
-        if (--held.depth == 0) { ::CloseHandle(held.handle); held.handle = INVALID_HANDLE_VALUE; held.path.clear(); }
+        if (--held.depth == 0) { held.lease.reset(); held.path.clear(); }
     }
     bool owns_lock() const { return owns_; }
     UpdateWriterLease(const UpdateWriterLease&) = delete;
     UpdateWriterLease& operator=(const UpdateWriterLease&) = delete;
 private:
-    struct Held { std::string path; HANDLE handle = INVALID_HANDLE_VALUE; unsigned depth = 0; };
+    struct Held { std::string path; std::unique_ptr<rta::platform::FileLease> lease; unsigned depth = 0; };
     static Held& current() { static thread_local Held held; return held; }
     std::unique_lock<std::recursive_mutex> local_;
     bool owns_ = false;
@@ -380,8 +357,7 @@ inline std::string staging_complete_path(const std::string& ver) { return join_p
 inline bool write_update_atomic(const std::string& path, const std::string& text) {
     const std::string tmp = path + ".tmp";
     if (!write_text_file(tmp, text)) return false;
-    return ::MoveFileExW(rta::platform::from_utf8(tmp).c_str(), rta::platform::from_utf8(path).c_str(),
-        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+    return rta::platform::durable_replace_file(rta::platform::from_utf8(tmp), rta::platform::from_utf8(path));
 }
 inline bool verify_staging(const std::string& ver, const std::string& staging,
     StagingManifest& m, std::string& err) {
@@ -522,7 +498,7 @@ struct UpdateState {
 };
 
 inline UpdateState& state() { static UpdateState s; return s; }
-inline unsigned long long now_ms() { return (unsigned long long)::GetTickCount64(); }
+inline unsigned long long now_ms() { return rta::platform::monotonic_ms(); }
 inline constexpr unsigned long long kCheckTtlMs = 300ull * 1000ull;
 
 inline std::string manifest_url() {
@@ -727,7 +703,7 @@ inline bool check_now(int timeoutMs) {
 // ---------------------------------------------------------------------------
 inline bool http_download(const std::string& url, const std::string& dst, int timeoutMs,
                           long long& outBytes, std::string& outSha, std::string& err) {
-    ::DeleteFileW(rta::platform::from_utf8(dst).c_str());
+    rta::platform::remove_file(rta::platform::from_utf8(dst));
     std::ofstream out(rta::platform::from_utf8(dst), std::ios::binary | std::ios::trunc);
     if (!out) { err = "无法写入：" + dst; return false; }
     bool writeErr = false;
@@ -757,9 +733,9 @@ inline bool http_download(const std::string& url, const std::string& dst, int ti
     };
     const auto resp = rta::platform::http_request(req);
     out.close();
-    if (writeErr) { ::DeleteFileW(rta::platform::from_utf8(dst).c_str()); err = "写盘失败（磁盘满/无权限）：" + dst; return false; }
+    if (writeErr) { rta::platform::remove_file(rta::platform::from_utf8(dst)); err = "写盘失败（磁盘满/无权限）：" + dst; return false; }
     if (!resp.ok) {
-        ::DeleteFileW(rta::platform::from_utf8(dst).c_str());
+        rta::platform::remove_file(rta::platform::from_utf8(dst));
         err = (resp.status == 0) ? (resp.error.empty() ? "网络不可达" : resp.error)
                                  : ("HTTP " + std::to_string(resp.status));
         return false;
@@ -807,7 +783,7 @@ inline void download_worker(ManifestExt man, Plan pl) {
     const std::string staging = join_path(dir, "staging");
     const std::string unpack = join_path(dir, "unpacked");
     if (!ensure_dir(dir)) { fail("无法创建目录：" + dir + "（安装目录不可写？）"); return; }
-    if (path_exists(staging_complete_path(ver)) && !::DeleteFileW(rta::platform::from_utf8(staging_complete_path(ver)).c_str())) { fail("无法清除旧暂存完成标记"); return; }
+    if (path_exists(staging_complete_path(ver)) && !rta::platform::remove_file(rta::platform::from_utf8(staging_complete_path(ver)))) { fail("无法清除旧暂存完成标记"); return; }
     if (!rmtree(staging)) { fail("无法清理旧 staging"); return; }
     if (!ensure_dir(staging)) { fail("无法创建 staging：" + staging); return; }
 
@@ -827,9 +803,8 @@ inline void download_worker(ManifestExt man, Plan pl) {
             if (!hex_equals_ci(hex, w)) { left.push_back(rel); continue; }
             const size_t sp = dst.find_last_of('\\');
             if (sp != std::string::npos) ensure_dir(dst.substr(0, sp));
-            ::DeleteFileW(rta::platform::from_utf8(dst).c_str());
-            if (!::MoveFileExW(rta::platform::from_utf8(src).c_str(),
-                               rta::platform::from_utf8(dst).c_str(), MOVEFILE_REPLACE_EXISTING))
+            rta::platform::remove_file(rta::platform::from_utf8(dst));
+            if (!rta::platform::move_file(rta::platform::from_utf8(src), rta::platform::from_utf8(dst), true))
                 left.push_back(rel);
         }
         pending.swap(left);
@@ -848,12 +823,12 @@ inline void download_worker(ManifestExt man, Plan pl) {
             s.shaExpected = man.deltaSha;
         }
         const VerifyResult vr = verify_downloaded_file(zip, man.deltaSha, man.deltaSize);
-        if (!vr.ok) { ::DeleteFileW(rta::platform::from_utf8(zip).c_str()); fail("delta 校验失败：" + vr.error); return; }
+        if (!vr.ok) { rta::platform::remove_file(rta::platform::from_utf8(zip)); fail("delta 校验失败：" + vr.error); return; }
         set_phase("extracting");
-        if (!unzip_to(zip, unpack, err)) { ::DeleteFileW(rta::platform::from_utf8(zip).c_str()); fail(err); return; }
+        if (!unzip_to(zip, unpack, err)) { rta::platform::remove_file(rta::platform::from_utf8(zip)); fail(err); return; }
         take_from(unpack);
         rmtree(unpack);
-        ::DeleteFileW(rta::platform::from_utf8(zip).c_str());
+        rta::platform::remove_file(rta::platform::from_utf8(zip));
     }
 
     // ② 逐文件兜底
@@ -872,13 +847,12 @@ inline void download_worker(ManifestExt man, Plan pl) {
             std::string sha, err;
             if (!http_download(url, tmp, 30000, bytes, sha, err)) { left.push_back(rel); continue; }
             const std::string w = want[lower_ascii(rel)];
-            if (!hex_equals_ci(sha, w)) { left.push_back(rel); ::DeleteFileW(rta::platform::from_utf8(tmp).c_str()); continue; }
+            if (!hex_equals_ci(sha, w)) { left.push_back(rel); rta::platform::remove_file(rta::platform::from_utf8(tmp)); continue; }
             const std::string dst = join_path(staging, rel);
             const size_t sp = dst.find_last_of('\\');
             if (sp != std::string::npos) ensure_dir(dst.substr(0, sp));
-            ::DeleteFileW(rta::platform::from_utf8(dst).c_str());
-            if (::MoveFileExW(rta::platform::from_utf8(tmp).c_str(),
-                              rta::platform::from_utf8(dst).c_str(), MOVEFILE_REPLACE_EXISTING)) ++fetched;
+            rta::platform::remove_file(rta::platform::from_utf8(dst));
+            if (rta::platform::move_file(rta::platform::from_utf8(tmp), rta::platform::from_utf8(dst), true)) ++fetched;
             else left.push_back(rel);
         }
         pending.swap(left);
@@ -898,7 +872,7 @@ inline void download_worker(ManifestExt man, Plan pl) {
                 take_from(unpack);
                 rmtree(unpack);
             }
-            ::DeleteFileW(rta::platform::from_utf8(zip).c_str());
+            rta::platform::remove_file(rta::platform::from_utf8(zip));
         }
     }
 
@@ -1013,22 +987,18 @@ inline void restore_staging_state() {
     auto& s = state();
     std::lock_guard<std::mutex> lk(s.mtx);
     if (s.staged || s.downloading) return;
-    WIN32_FIND_DATAW fd{};
-    HANDLE h = ::FindFirstFileW(rta::platform::from_utf8(join_path(updates_root(), "*")).c_str(), &fd);
-    if (h == INVALID_HANDLE_VALUE) return;
     std::string best;
-    do {
-        const std::wstring nm(fd.cFileName);
-        if (nm == L"." || nm == L"..") continue;
-        if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) continue;
-        const std::string v = rta::platform::detail::narrow(nm);
+    std::error_code ec;
+    for (std::filesystem::directory_iterator it(rta::platform::from_utf8(updates_root()), ec), end;
+         !ec && it != end; it.increment(ec)) {
+        if (!it->is_directory(ec)) continue;
+        const std::string v = rta::platform::to_utf8(it->path().filename());
         const std::string st = join_path(join_path(updates_root(), v), "staging");
         StagingManifest manifest; std::string error;
         if (is_dir(st) && verify_staging(v, st, manifest, error)) {
             if (best.empty() || cmp_versions(v, best) > 0) best = v;
         }
-    } while (::FindNextFileW(h, &fd));
-    ::FindClose(h);
+    }
     if (best.empty()) return;
     const std::string st = join_path(version_dir(best), "staging");
     s.staged = true;

@@ -844,5 +844,9 @@ set_tests_properties(audit_web_lifecycle PROPERTIES TIMEOUT 60)
 
 add_test(NAME audit_capture_offline COMMAND test_capture --offline)
 
+add_executable(test_meta_platform tests/test_meta_platform.cpp)
+target_link_libraries(test_meta_platform PRIVATE rtadsp)
+add_test(NAME audit_meta_platform COMMAND test_meta_platform)
+
 # Resource-dependent tests must support an out-of-tree build directory.
 target_compile_definitions(test_opra_eq PRIVATE RTA_TEST_SOURCE_DIR="${CMAKE_SOURCE_DIR}")

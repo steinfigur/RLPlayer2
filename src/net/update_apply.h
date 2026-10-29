@@ -25,7 +25,6 @@
 //   ③ 用户的语义是「重启就完成」，启动器启动时本来就有"文件不被占用"的完美时机。
 //   ⟹ 改成启动器内直接落地，链路更短、无外部依赖、可被同一份单测覆盖。
 #pragma once
-#include <tlhelp32.h>
 
 #include <algorithm>
 #include <string>
@@ -179,8 +178,7 @@ inline bool write_pending(const PendingPlan& p) {
 inline std::string now_text() {
     char b[64];
     std::time_t t = std::time(nullptr);
-    std::tm v{};
-    localtime_s(&v, &t);
+    const std::tm v = rta::platform::update_local_time(t);
     std::snprintf(b, sizeof(b), "%04d-%02d-%02d %02d:%02d:%02d",
                   v.tm_year + 1900, v.tm_mon + 1, v.tm_mday, v.tm_hour, v.tm_min, v.tm_sec);
     return std::string(b);
@@ -216,13 +214,13 @@ inline bool write_ready_plan(const std::string& ver, const std::string& from,
 
 // 同卷改名优先；跨卷（极端情况）退回 复制+删除
 inline bool move_file(const std::string& from, const std::string& to) {
-    const std::wstring wf = rta::platform::from_utf8(from);
-    const std::wstring wt = rta::platform::from_utf8(to);
-    ::SetFileAttributesW(wt.c_str(), FILE_ATTRIBUTE_NORMAL);
-    if (::MoveFileExW(wf.c_str(), wt.c_str(), MOVEFILE_REPLACE_EXISTING)) return true;
-    if (!::CopyFileW(wf.c_str(), wt.c_str(), FALSE)) return false;
-    ::SetFileAttributesW(wf.c_str(), FILE_ATTRIBUTE_NORMAL);
-    return ::DeleteFileW(wf.c_str()) != 0;
+    const auto wf = rta::platform::from_utf8(from);
+    const auto wt = rta::platform::from_utf8(to);
+    rta::platform::reset_file_attributes(wt);
+    if (rta::platform::move_file(wf, wt, true)) return true;
+    if (!rta::platform::copy_file(wf, wt, false)) return false;
+    rta::platform::reset_file_attributes(wf);
+    return rta::platform::remove_file(wf);
 }
 
 // Rollback uses the journal written BEFORE touching each file. A crash after moving
@@ -244,7 +242,7 @@ inline bool rollback_files(PendingPlan& p, std::string& detail) {
         const std::string tgt = join_path(inst, *it), b = join_path(bak, *it);
         const bool added = std::find(p.added.begin(), p.added.end(), *it) != p.added.end();
         bool ok = false;
-        if (added) ok = !path_exists(tgt) || ::DeleteFileW(rta::platform::from_utf8(tgt).c_str()) != 0;
+        if (added) ok = !path_exists(tgt) || rta::platform::remove_file(rta::platform::from_utf8(tgt)) != 0;
         else {
             const auto original = p.originalSha.find(*it);
             auto matches_original = [&](const std::string& path) {
@@ -418,11 +416,7 @@ inline std::string state_json() {
 // 7. 请启动器退出（"立即重启并更新"用；铁律 2：只发它本来就会处理的 WM_COMMAND）
 // ===========================================================================
 inline bool request_launcher_exit() {
-    HWND h = ::FindWindowW(L"RLPlayerTray", nullptr);
-    if (!h) h = ::FindWindowW(L"RLPlayerTray", L"RLPlayerTray");
-    if (!h) return false;
-    ::PostMessageW(h, WM_COMMAND, (WPARAM)1003, 0);   // ID_TRAY_EXIT（tools/launcher.cpp）
-    return true;
+    return rta::platform::request_update_launcher_exit();
 }
 
 inline std::string powershell_unused_marker() { return std::string(); }

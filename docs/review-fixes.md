@@ -71,6 +71,10 @@
 - `verify.ps1`使用动态端口、GUID隔离目录、监听PID归属检查和正常退出；旧NAA正测替换为当前不支持后端的拒绝验收，保留RTANet与DirectSDM原门禁。
 - JSON大finite数转字符串与反馈序列化避免long long越界转换，保留足够精度。`rtahealth --json` stdout保持单行JSON，缓存保存失败明确非0退出。
 
+## 平台边界门禁补齐
+
+原始提交使用同一官方扫描器已有119处违规，首个修复提交为133处。本轮将更新原生锁/文件/进程、反馈主机观察/单次HTTP、文本转换和环境读取移入`src/platform/`纯接口与`windows/`实现；业务仍留net/meta，曲库复用既有文件接口。完整扫描最终**违规0、退出0**，原3条socket白名单及扫描器均未修改。新增98项编码/环境回归保留坏UTF8替换、嵌入NUL、GBK降级、63/64长度边界和各开关的空白差异。接口说明同步到[`PLATFORM.md`](../PLATFORM.md)。
+
 ## 完整门禁暴露的旧测试问题
 
 原基线在同一Clang23 Release环境下EC-7@DSD512矩形窗SNR约103.5dB，低于原105dB门槛。本次没有改调制器数值体或放宽门槛：独立直接DFT、已知两音/白噪声与多相位验证证实强带外量化噪声的有限矩形窗边界泄漏。测试改用能量归一化周期Hann窗；0.5基波与1e-4带内污染得到73.9794dB，仍必须失败105dB，白噪声功率校准误差约0.121dB。过载/恢复/限幅判据保留。
@@ -80,6 +84,8 @@
 严格JSON也揭出了原正向fixture的缺括号、未转义换行/引号及把UTF-8码点拆进不同JSON event的问题。修正正向fixture并补拒绝反例，保留SSE传输按3/11字节切分的回归；没有放松生产解析器。
 
 OPRA测试显式使用源码资源目录，支持仓库外构建。标签A/B测试改为FFmpeg真编码四格式各5份，保留完整20文件逐字段/±1帧断言与1000文件吞吐回归。200字符文件名测试使用独立短临时目录并检查夹具写入成功，避免把构建路径过长造成的“文件未创建”误报成分析器失败。
+
+首轮远端CI正式构建成功，116个CTest只有`health_robust`失败：旧断言硬编码`D:`，云端TEMP在`C:`。修正为实际错误JSON逐字往返，再用显式Windows路径校验反斜杠转义；没有放宽序列化要求或修改生产实现。该目标纳入最终14项相关CTest，已通过。
 
 ## 旧清单的验收修正
 
@@ -103,9 +109,10 @@ F12不能解释为禁止已确认缺失条目的独立自动清理。仓库明�
 
 - 正式Clang Release全量构建退出0；本地完整CTest **115个目标、0失败、CTest跳过0，622.79秒**。本轮排除真实设备目标`wasapi_shared`和`capture`，保留`audit_capture_offline`的原模拟断言。
 - 完整轮次内部整项目跳过两项：`gpu_bridge`无GPU DLL、`ffmpeg_matrix`缺包内精简工具。随后按仓库官方发行清单SHA256校验400MB包，隔离提取未修改FFmpeg/FFprobe；矩阵实际补跑**38项通过、0失败**，没有用系统完整版替代精简版。
-- 最终补充CTest **3个目标、0失败、0跳过，退出0**：真实应用53项、门禁17项、格式矩阵38项。对应最后的backend入口、夹具、CI准备脚本和门禁修改；其余代码复用前一完整轮次证据。
+- 第一阶段补充CTest **3个目标、0失败、0跳过，退出0**：真实应用53项、门禁17项、格式矩阵38项。对应最后的backend入口、夹具、CI准备脚本和门禁修改；其余代码复用前一完整轮次证据。
+- 平台分层及盘符测试修正后再次正式Clang全量构建退出0；最终相关CTest **14个目标、0失败、0跳过，退出0，63.09秒**，覆盖更新、曲库、CUE、标签、反馈、真实应用、健康回归及新增98项元数据平台语义。最终真实WebView截图重新生成并绑定该构建。
 - CI新增精简工具准备步骤，并拒绝`gpu_bridge`之外的内部整项目跳过。配置/构建/CTest原始退出码、零测试、缺报告、意外全跳过均不能报绿；最终CI按提交重新全量构建和执行，不以本地hook或代理自述代替。
-- 真WebView2截图绑定本次`rtaweb.exe` SHA256，见[UI凭据](review-evidence/ui-receipt.json)；主要测试数量及边界见[本地验收摘要](review-evidence/local-verification.json)。完整本地日志位于仓库外`../review-fixes/`，关键文件为`local-complete115.xml`、`LastTest-complete115.log`、`ctest-supplement.log`、`check-codec-prepare.log`。
+- 真WebView2截图绑定本次`rtaweb.exe` SHA256，见[UI凭据](review-evidence/ui-receipt.json)；主要测试数量及边界见[本地验收摘要](review-evidence/local-verification.json)。完整本地日志位于仓库外`../review-fixes/`，关键文件为`local-complete115.xml`、`LastTest-complete115.log`、`ctest-supplement.log`、`check-codec-prepare.log`、`ctest-platform-final.log`、`platform-boundary-{baseline,final}.log`。
 - 全产品构建使用项目正式Clang工具链；MSVC只完成专项，原巨型UI raw string触及MSVC C2026限制，未声称全产品MSVC兼容。完整`verify.ps1`包含GPU/ROCm前提，本机未运行该整套硬件门禁，也未打包或发布Windows Full版本。
 
 远端记录入口：[Fork CI](https://github.com/steinfigur/RLPlayer2/actions/workflows/ci.yml)。请核对记录的提交SHA和最终状态；本地115目标不包括上述真实设备和GPU验收。
