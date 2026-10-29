@@ -302,17 +302,24 @@ public:
     // 播放开始 / 切歌切率：按新采样率重建系数并清状态（新曲起点，不需要交叉淡入）
     void prepare(double fs, int channels) {
         std::lock_guard<std::mutex> lk(mu_);
-        const bool rateChanged = (std::fabs(fs - fs_) > 1e-9);
-        if (rateChanged) {
-            fs_ = (fs > 0.0) ? fs : 48000.0;
-            rebuild_locked(false);
-        }
-        if (channels < 1) channels = 1;
-        if (channels != ch_) {
-            ch_ = channels;
-            chans_.assign((size_t)ch_, Chan{});
-            rebuild_locked(false);
-        }
+        fs_ = (fs > 0.0) ? fs : 48000.0;
+        ch_ = std::max(1, channels);
+        chans_.assign((size_t)ch_, Chan{});
+        rebuild_locked(false);
+    }
+
+    // Seek discards all history without changing the current target settings.
+    void reset() {
+        std::lock_guard<std::mutex> lk(mu_);
+        chans_.assign((size_t)ch_, Chan{});
+        rebuild_locked(false);
+    }
+
+    bool needs_processing() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        for (const auto& c : chans_)
+            if (c.fadeLeft > 0 || !c.cur.empty() || c.gainCur != 1.0) return true;
+        return false;
     }
 
     // 参数热更新：新链从零状态启动，与旧链交叉淡入，不打断音频线程
@@ -395,7 +402,8 @@ private:
         for (auto& c : chans_) {
             std::vector<PeqBiquadF32> next(coeffs.size());
             for (size_t i = 0; i < coeffs.size(); ++i) next[i].set(coeffs[i]);
-            if (crossfade) {
+            const bool unchangedFlat = c.fadeLeft == 0 && c.cur.empty() && next.empty() && c.gainCur == gain;
+            if (crossfade && !unchangedFlat) {
                 // 旧链连同其滤波器状态整体挪到 prev，保证淡入期间输出连续
                 c.prev = std::move(c.cur);
                 c.gainPrev = c.gainCur;

@@ -49,6 +49,15 @@ public:
         return x * current_;
     }
 
+    // Advance the envelope once per frame, then share that gain across all channels.
+    void process_planar(std::vector<std::vector<double>>& planes) {
+        if (planes.empty()) return;
+        for (size_t n = 0; n < planes[0].size(); ++n) {
+            const double g = process(1.0);
+            if (g != 1.0) for (auto& p : planes) p[n] *= g;
+        }
+    }
+
     void process(double* buf, size_t n) {
         for (size_t i = 0; i < n; ++i) buf[i] = process(buf[i]);
     }

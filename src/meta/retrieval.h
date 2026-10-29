@@ -1060,12 +1060,14 @@ inline SummaryResult summary_build_from_profile_reply(const std::string& reply,
 // 缓存序列化、反序列化、落盘与路径
 // ---------------------------------------------------------------------------
 
+inline constexpr int kSummaryCacheVersion = 6;
+inline constexpr int kSummaryCacheMinVersion = 5; // v4 and earlier contain known attribution errors.
+inline bool summary_language_valid(const std::string& lang) { return knowledge_language_valid(lang); }
 inline fsx::path summary_cache_path(const std::string& baseDir,
                                     const std::string& entity_id,
                                     const std::string& lang) {
-    const std::string b = baseDir.empty() ? EntityStore::instance().baseDir() : baseDir;
-    const std::string l = lang.empty() ? "zh" : lang;
-    return meta_path_of(b) / "entities" / entity_id / ("summary-" + l + ".json");
+    if (!summary_language_valid(lang)) return {};
+    return knowledge_entity_path(baseDir, entity_id, "summary-" + (lang.empty() ? "zh" : lang) + ".json");
 }
 
 inline std::string summary_to_json(const SummaryResult& sr) {
@@ -1082,7 +1084,7 @@ inline std::string summary_to_json(const SummaryResult& sr) {
       //   而那个页面实际是完全不相干的《火花》。这类错误带可点击链接、看起来像已核实的事实，
       //   比"没查到"更有害 ⟹ v4 缓存一律不复用，下次打开重新生成一次。
       //   （代价：已整理过的资料会重算一次，消耗一次额度。用户已确认接受。）
-      << "  \"v\": 6,\n"
+      << "  \"v\": " << kSummaryCacheVersion << ",\n"
       << "  \"ok\": " << (sr.ok ? "true" : "false") << ",\n"
       << "  \"ai\": " << (sr.ai ? "true" : "false") << ",\n"
       << "  \"model\": \"" << meta_jesc(sr.model) << "\",\n"
@@ -1169,18 +1171,23 @@ inline bool summary_from_json(const std::string& text,
     sr_out.ai = j.has("ai") ? j["ai"].b : true;
     sr_out.model = j["model"].s();
     if (sr_out.model.empty()) sr_out.model = "deepseek-flash";
-    sr_out.generated_at = (long long)j["generated_at"].n();
-    sr_out.expires_at = (long long)j["expires_at"].n();
-    if (sr_out.expires_at <= 0 && sr_out.generated_at > 0) {
-        sr_out.expires_at = sr_out.generated_at + 7 * 86400; // 默认 TTL 7 天
-    }
-    // 2026-10-24（261024-01 #4）：v2 之前的缓存没有结构化标签 → 视为已过期，重新生成一次
-    //（否则升级后老用户永远看不到标签网格）。
-    sr_out.cache_ver = (int)j["v"].n();
-    // v3：消歧义过滤 + 400 降级链 + 输出精简（旧内容可能质量差/来自误判，统一重生成一次）
-    // 注意用 1（1970 年）而不是 0：summary_is_expired 对 expires_at<=0 会回退到 generated_at+7d，
-    // 设 0 等于"永不过期"（2026-10-24 实测：缓存 v2 文件一直 cache-hit，v3 失效没生效）。
-    if ((int)j["v"].n() < 3) sr_out.expires_at = 1;
+    // Persistent timestamps must be exact, nonnegative JSON integers within double's exact range.
+    const auto timestamp = [](const rta::net::Json& value) -> long long {
+        if (value.type != rta::net::Json::Num || value.num <= 0 ||
+            value.num > 9007199254740991.0 || std::floor(value.num) != value.num) return 0;
+        return static_cast<long long>(value.num);
+    };
+    sr_out.generated_at = timestamp(j["generated_at"]);
+    sr_out.expires_at = timestamp(j["expires_at"]);
+    if (j.has("expires_at") && sr_out.expires_at <= 0) sr_out.expires_at = 1;
+    if (!j.has("expires_at") && sr_out.generated_at > 0)
+        sr_out.expires_at = sr_out.generated_at + 7 * 86400;
+    const auto& version = j["v"];
+    sr_out.cache_ver = version.type == rta::net::Json::Num && version.num >= 0 &&
+        version.num <= kSummaryCacheVersion && std::floor(version.num) == version.num
+        ? static_cast<int>(version.num) : -1;
+    // Retired attribution rules must not be accepted under a future TTL.
+    if (sr_out.cache_ver < kSummaryCacheMinVersion) sr_out.expires_at = 1;
     sr_out.disclaimer = j["disclaimer"].s();
     if (j.has("from_cache")) sr_out.from_cache = j["from_cache"].b;
     if (j.has("offline")) sr_out.offline = j["offline"].b;
@@ -1282,6 +1289,7 @@ inline bool summary_from_json(const std::string& text,
 }
 
 inline bool summary_is_expired(const SummaryResult& sr, long long now_sec = 0) {
+    if (sr.cache_ver != 0 && (sr.cache_ver < kSummaryCacheMinVersion || sr.cache_ver > kSummaryCacheVersion)) return true;
     if (now_sec <= 0) now_sec = (long long)std::time(nullptr);
     long long exp = sr.expires_at;
     if (exp <= 0 && sr.generated_at > 0) {
@@ -1297,6 +1305,7 @@ inline bool summary_save_cache(const std::string& baseDir,
                                const SummaryResult& sr) {
     if (entity_id.empty()) return false;
     const fsx::path p = summary_cache_path(baseDir, entity_id, lang);
+    if (p.empty()) return false;
     const std::string content = summary_to_json(sr);
     return entity_write_atomic(p, content);
 }
@@ -1308,12 +1317,21 @@ inline bool summary_load_cache(const std::string& baseDir,
                                std::string* err_out = nullptr) {
     if (entity_id.empty()) return false;
     const fsx::path p = summary_cache_path(baseDir, entity_id, lang);
+    if (p.empty()) { if (err_out) *err_out = "invalid summary cache identity or language"; return false; }
     std::string text;
     if (!entity_read_file(p, text)) {
         if (err_out) *err_out = "cache file not found or empty";
         return false;
     }
-    return summary_from_json(text, sr_out, err_out);
+    SummaryResult loaded;
+    if (!summary_from_json(text, loaded, err_out)) return false;
+    // Semantic retirement also applies to offline and error fallback paths.
+    if (loaded.cache_ver < kSummaryCacheMinVersion || loaded.cache_ver > kSummaryCacheVersion) {
+        if (err_out) *err_out = "summary cache semantic version retired or unsupported";
+        return false;
+    }
+    sr_out = std::move(loaded);
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1832,6 +1850,7 @@ inline SummaryResult summary_ai_only_generate(const std::string& entityName,
                                               ProgressFn on_progress = nullptr,
                                               const std::string& evidence = std::string(),
                                               const ProfileContext* ctx = nullptr) {
+    if (!summary_language_valid(lang)) { SummaryResult invalid; invalid.error = "invalid summary language"; return invalid; }
     SummaryProgressEmitter progress(on_progress);   // 拷贝（不是 move）：嵌套兜底路径还要复用同一个回调
     // 2026-10-27（261027-06）：有 ctx 就按分类提示词写（"不过滤"同样适用），没有就走旧的简短简介。
     const bool use_profile = (ctx && ctx->valid);
@@ -1927,6 +1946,7 @@ inline SummaryResult retrieval_fetch_track(const std::string& title,
                                            const std::string& lang,
                                            const RetrievalOptions& opts,
                                            ProgressFn on_progress = nullptr) {
+    if (!summary_language_valid(lang)) { SummaryResult invalid; invalid.error = "invalid summary language"; return invalid; }
     SummaryProgressEmitter progress(on_progress);   // 拷贝（不是 move）：嵌套兜底路径还要复用同一个回调
     const std::string baseDir = !opts.metabase.empty() ? opts.metabase : EntityStore::instance().baseDir();
     const std::string eid = entity_make_id("track", entity_norm(artist) + "\x1f" + entity_norm(title));
@@ -2117,6 +2137,7 @@ inline SummaryResult retrieval_fetch(EntityKind kind,
                                      const RetrievalOptions& opts = {},
                                      ProgressFn on_progress = nullptr) {
     // 进度回调（可为空）：空时全程走 llm_chat，行为与改造前逐字段一致。
+    if (!summary_language_valid(lang)) { SummaryResult invalid; invalid.error = "invalid summary language"; return invalid; }
     SummaryProgressEmitter progress(on_progress);
     const std::string eid = !opts.entity_id.empty()
         ? opts.entity_id

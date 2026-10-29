@@ -118,6 +118,11 @@ public:
 
     const IntegratorConfig& config() const { return cfg_; }
     uint32_t decimation() const { return M_; }
+    // Exact output clock, including a partial final decimation interval.
+    size_t output_frames(uint64_t bits) const {
+        // Both single- and two-stage paths emit their first sample at bit zero.
+        return (size_t)(bits / M_ + (bits % M_ != 0));
+    }
     uint32_t outRate() const { return cfg_.outRate; }
     double stopbandStartHz() const { return stopbandHz_; }
     bool isTwoStage() const {

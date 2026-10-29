@@ -163,9 +163,8 @@ bool write_file(const std::string& path, const std::vector<uint8_t>& v) {
 }
 
 // DSF：28 字节头 + fmt(52) + data；每声道按 blockSize 分块交错（末块补齐整块）。
-bool write_dsf(const std::string& path, uint32_t rate, int ch, double seconds, double amp) {
-    const int64_t bits = (int64_t)((double)rate * seconds);
-    auto data = make_dsd(bits, ch, rate, amp);
+bool write_dsf(const std::string& path, uint32_t rate, int64_t bits, const std::vector<std::vector<uint8_t>>& data) {
+    const int ch = (int)data.size();
     const uint32_t blockSize = 4096;
     const uint64_t needBytes = (uint64_t)((bits + 7) / 8);
     const uint64_t blocks = (needBytes + blockSize - 1) / blockSize;
@@ -201,10 +200,9 @@ bool write_dsf(const std::string& path, uint32_t rate, int ch, double seconds, d
     return write_file(path, f);
 }
 
-// DFF(DSDIFF)：FRM8("DSD ") → FVER → PROP(SND: FS/CHNL/CMPR) → DSD(每声道连续)
-bool write_dff(const std::string& path, uint32_t rate, int ch, double seconds, double amp) {
-    const int64_t bits = (int64_t)((double)rate * seconds);
-    auto data = make_dsd(bits, ch, rate, amp);
+// DFF(DSDIFF)：FRM8("DSD ") → FVER → PROP(SND: FS/CHNL/CMPR) → DSD(L0,R0,L1,R1… byte-interleaved)
+bool write_dff(const std::string& path, uint32_t rate, int64_t bits, const std::vector<std::vector<uint8_t>>& data) {
+    const int ch = (int)data.size();
     const uint64_t perCh = (uint64_t)((bits + 7) / 8);
 
     std::vector<uint8_t> snd;
@@ -215,15 +213,19 @@ bool write_dff(const std::string& path, uint32_t rate, int ch, double seconds, d
     put_tag(snd, "CHNL"); put_be64(snd, 2 + 4 * (uint64_t)ch); put_be16(snd, (uint16_t)ch);
     const char* ids[2] = {"SLFT", "SRGT"};
     for (int c = 0; c < ch; ++c) put_tag(snd, ids[c & 1]);
-    put_tag(snd, "CMPR"); put_be64(snd, 4 + 1 + 3); put_tag(snd, "DSD ");
-    snd.push_back(14); snd.push_back(0); snd.push_back(0); snd.push_back(0);   // 名称长度 + "not compressed"
+    const std::string compressionName = "not compressed";
+    put_tag(snd, "CMPR"); put_be64(snd, 4 + 1 + compressionName.size()); put_tag(snd, "DSD ");
+    snd.push_back((uint8_t)compressionName.size());
+    snd.insert(snd.end(), compressionName.begin(), compressionName.end());
+    if ((4 + 1 + compressionName.size()) & 1) snd.push_back(0);
 
     std::vector<uint8_t> body;
     put_tag(body, "FVER"); put_be64(body, 4); put_be32(body, 0x01050000u);
     put_tag(body, "PROP"); put_be64(body, snd.size()); body.insert(body.end(), snd.begin(), snd.end());
     if (snd.size() & 1) body.push_back(0);
     put_tag(body, "DSD "); put_be64(body, perCh * (uint64_t)ch);
-    for (int c = 0; c < ch; ++c) body.insert(body.end(), data[(size_t)c].begin(), data[(size_t)c].end());
+    for (uint64_t n = 0; n < perCh; ++n)
+        for (int c = 0; c < ch; ++c) body.push_back(data[(size_t)c][(size_t)n]);
     if (body.size() & 1) body.push_back(0);
 
     std::vector<uint8_t> f;
@@ -366,6 +368,38 @@ int child_main(const std::string& dir) {
                            rta::audio::widen(out) + L"\"", &log);
         if (rc == 0 && fsize(out) > 1000) ok(std::string("精简版 ffmpeg 回退解码 ") + f);
         else bad(std::string("精简版 ffmpeg 回退解码 ") + f + "：rc=" + std::to_string(rc) + " " + log.substr(0, 160));
+    }
+
+    // Same original bit planes encoded independently as DSF/DSDIFF must decode identically.
+    // The fixture writers above deliberately do not call the product write_dsf/write_dff.
+    if (exists(dir + "/m.dsf") && exists(dir + "/m.dff")) {
+        try {
+            const auto dsf = rta::audio::read_dsf(dir + "/m.dsf");
+            const auto dff = rta::audio::read_dff(dir + "/m.dff");
+            if (dsf.rate == dff.rate && dsf.channels == dff.channels && dsf.bits == dff.bits && dsf.data == dff.data)
+                ok("DSF/DFF 相同源有效 1-bit 数据逐位一致");
+            else bad("DSF/DFF 相同源 1-bit 数据或元数据不一致");
+            const auto a = rta::audio::read_any(dir + "/m.dsf");
+            const auto b = rta::audio::read_any(dir + "/m.dff");
+            if (a.rate == b.rate && a.channels == b.channels && a.bits == b.bits && a.raw == b.raw)
+                ok("DSF/DFF 产品解码 PCM 逐样本一致");
+            else bad("DSF/DFF 产品解码 PCM 不一致");
+
+            // Independent FFmpeg demux/copy verifies the standard DFF wire order.
+            const std::string copied = dir + "/dff-copy.dsd";
+            std::string log;
+            const int rc = run(L"\"" + rta::audio::widen(ffmpeg) + L"\" -v error -y -i \"" +
+                rta::audio::widen(dir + "/m.dff") + L"\" -map 0:a:0 -c:a copy -f data \"" +
+                rta::audio::widen(copied) + L"\"", &log);
+            std::ifstream raw(fs::u8path(copied), std::ios::binary);
+            std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(raw)), std::istreambuf_iterator<char>());
+            bool same = rc == 0 && bytes.size() == (size_t)(dsf.bits / 8) * (size_t)dsf.channels;
+            for (size_t n = 0; same && n < (size_t)(dsf.bits / 8); ++n)
+                for (int c = 0; c < dsf.channels; ++c)
+                    if (bytes[n * (size_t)dsf.channels + (size_t)c] != dsf.data[(size_t)c][n]) { same = false; break; }
+            if (same) ok("精简版 FFmpeg 独立 DFF copy 与 L0,R0,L1,R1 标准字节交错一致");
+            else bad("精简版 FFmpeg DFF copy 交错核验失败：rc=" + std::to_string(rc) + " " + log.substr(0, 120));
+        } catch (const std::exception& e) { bad(std::string("DSF/DFF 独立一致性核验异常：") + e.what()); }
     }
 
     // --- 3. 标签写回（remux，-c copy）用到的 8 个 muxer ---
@@ -578,8 +612,11 @@ int main(int argc, char** argv) {
     }
 
     // DSD：ffmpeg 9.0 没有 DSD 编码器 → 自己合成（见文件头 ⚠️）
-    if (!write_dsf(dir + "/m.dsf", 2822400, 2, 0.5, 0.001)) uncovered.push_back("dsf（本地合成失败）");
-    if (!write_dff(dir + "/m.dff", 2822400, 2, 0.5, 0.001)) uncovered.push_back("dff（本地合成失败）");
+    const uint32_t dsdRate = 2822400;
+    const int64_t dsdBits = dsdRate / 2;
+    const auto dsdSource = make_dsd(dsdBits, 2, dsdRate, 0.001); // One source, two independently encoded containers.
+    if (!write_dsf(dir + "/m.dsf", dsdRate, dsdBits, dsdSource)) uncovered.push_back("dsf（本地合成失败）");
+    if (!write_dff(dir + "/m.dff", dsdRate, dsdBits, dsdSource)) uncovered.push_back("dff（本地合成失败）");
 
     // 带内嵌封面的 FLAC：先造一张 PNG，再用 -map 把图作为 attached_pic 塞进 FLAC
     {

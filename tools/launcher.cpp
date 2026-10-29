@@ -1633,6 +1633,13 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     if (!started) {
         const std::string upd = rta::update::apply_pending_on_startup();
         if (!upd.empty()) logf(L"%s", utf8_to_wide(upd).c_str());
+        const auto pending = rta::update::read_pending();
+        if (pending.phase == "applying" || pending.phase == "rollback_failed" || pending.phase == "ready") {
+            logf(L"更新尚未完成，拒绝启动可能混合版本的服务");
+            MessageBoxW(nullptr, utf8_to_wide(upd.empty() ? "更新尚未完成，请关闭同目录的旧实例后重试。恢复材料已保留。" : upd).c_str(),
+                        kAppName, MB_ICONERROR | MB_OK);
+            return 1;
+        }
     }
 
     if (!started) logf(L"未发现已有实例，开始启动服务");
@@ -1659,8 +1666,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     // 回滚判据不靠"感觉"：5 秒窗口内 rtaweb 没监听端口（或子进程提前退出）就算失败。
     if (!started) {
         const std::string rb = rta::update::rollback_pending("新版本启动失败（rtaweb 未在 5 秒内监听端口）");
-        if (!rb.empty()) {
-            logf(L"%s", utf8_to_wide(rb).c_str());
+        if (!rb.empty()) logf(L"%s", utf8_to_wide(rb).c_str());
+        if (rta::update::read_pending().phase == "rolled_back") {
             for (int p = (forcedPort ? forcedPort : kDefaultPort);
                  p < (forcedPort ? forcedPort + 1 : kDefaultPort + 12) && !started; ++p) {
                 if (port_open(p)) continue;

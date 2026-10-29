@@ -15,6 +15,15 @@ using namespace rta::engine;
 using rta::audio::AudioBuffer;
 namespace dsp = rta::dsp;
 
+// A finite source ends only after the pipeline has emitted its delayed content.
+static AudioBuffer complete(Pipeline& pl, const AudioBuffer& in, PipelineStats* st) {
+    auto out = pl.process(in, st);
+    auto tail = pl.finish();
+    out.raw.insert(out.raw.end(), tail.raw.begin(), tail.raw.end());
+    if (st) st->outFrames = out.frames();
+    return out;
+}
+
 static int fails = 0;
 static void note(const std::string& what, const std::string& detail) {
     printf("  [记录] %s %s\n", what.c_str(), detail.c_str());
@@ -59,6 +68,8 @@ static AudioBuffer run_chunked(const AudioBuffer& in, const PipelineConfig& cfg,
         AudioBuffer o = pl.process(seg, &st);
         out.raw.insert(out.raw.end(), o.raw.begin(), o.raw.end());
     }
+    auto tail = pl.finish();
+    out.raw.insert(out.raw.end(), tail.raw.begin(), tail.raw.end());
     return out;
 }
 
@@ -83,7 +94,7 @@ int main() {
         PipelineConfig cfg;
         Pipeline pl(cfg);
         PipelineStats st;
-        auto whole = pl.process(src, &st);
+        auto whole = complete(pl, src, &st);
         auto chunked = run_chunked(src, cfg, 4096);
         const size_t d = diff_count(whole, chunked);
         note("直通路径 整块 vs 4096 帧分块", "(差异 " + std::to_string(d) + " 个样本)");
@@ -96,7 +107,7 @@ int main() {
         cfg.outRate = 96000; cfg.outBits = 24; cfg.taps = 8192;
         Pipeline pl(cfg);
         PipelineStats st;
-        auto whole = pl.process(src, &st);
+        auto whole = complete(pl, src, &st);
         auto chunked = run_chunked(src, cfg, 4096);
         const size_t d = diff_count(whole, chunked);
         char buf[200];
@@ -116,7 +127,7 @@ int main() {
         cfg.channel[1].eq.push_back(q);
         Pipeline pl(cfg);
         PipelineStats st;
-        auto whole = pl.process(src, &st);
+        auto whole = complete(pl, src, &st);
         auto chunked = run_chunked(src, cfg, 4096);
         const size_t d = diff_count(whole, chunked);
         char buf[200];
@@ -137,28 +148,16 @@ int main() {
         cfg.channel[1].ir = ir;
         Pipeline pl(cfg);
         PipelineStats st;
-        auto whole = pl.process(src, &st);
+        auto whole = complete(pl, src, &st);
         auto chunked = run_chunked(src, cfg, 4096);
         const size_t d = diff_count(whole, chunked);
         char buf[200];
         std::snprintf(buf, sizeof(buf), "(差异 %zu / %zu 样本, %.1f%%)",
                       d, whole.raw.size(), 100.0 * (double)d / (double)whole.raw.size());
         note("卷积路径 整块 vs 4096 帧分块", buf);
-        // ⚠️ 未解决：卷积器仍是分块对齐的（均匀分块 FFT 要求固定块长）。
-        //    要让它与任意分块无关，需要加输入 FIFO + 输出 FIFO，使两条路径
-        //    具有相同的 convBlock 延迟。留待下一轮，此处只记录不断言。
-        printf("       ^ 已知未解决：卷积器仍要求调用长度与 convBlock 对齐\n");
+        check(d == 0, "卷积路径与任意分块无关，EOF 后长度及尾样本一致", buf);
     }
 
-    printf("\n=== 结论 ===\n");
-    printf("  上表刻画了当前「整块处理」的局限：\n");
-    printf("  Round 32 基线：升频 71%%、EQ 6.8%%、卷积 10.6%% 的样本在分块后不同。\n");
-    printf("  Round 33 改造后：升频与 EQ 已【归零】—— 重采样器与双二阶改为持久状态。\n");
-    printf("  仍待解决：卷积器（需要输入/输出 FIFO 以统一块对齐）。\n");
-    printf("\n  流式改造后必须满足：**同一输入任意分块方式，输出逐位一致**。\n");
-    printf("  这就是改造的验收判据。\n");
-
-    printf("\n%s (断言失败项 %d —— 本文件以刻画为主，只对直通路径做硬断言)\n",
-           fails == 0 ? "直通路径断言通过" : "存在失败", fails);
+    printf("\n%s (断言失败项 %d)\n", fails == 0 ? "所有流式路径通过" : "存在失败", fails);
     return fails == 0 ? 0 : 1;
 }

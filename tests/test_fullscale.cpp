@@ -71,6 +71,8 @@ static Result run_case(uint32_t outRate, double preAttenDb) {
         out.insert(out.end(), o.raw.begin(), o.raw.end());
     }
 
+    auto tail = pl.finish();
+    out.insert(out.end(), tail.raw.begin(), tail.raw.end());
     const double fs = (double)(1u << 23);               // 24-bit 满幅
     const size_t nF = out.size() / 2;
     Result r;

@@ -10,10 +10,12 @@
 //     项目约定不引第三方 JSON 库）。
 //  3) 损坏文件如实报错、绝不静默清空：构造时解析失败 → loadError() 非空，此时
 //     save() 拒绝写盘（防止用一个空库把用户缓存覆盖掉），需要人工删掉/修复缓存文件。
-//  4) save() 原子写：先写 <path>.tmp 再 rename，崩溃最多留下一个 tmp，不会写坏正身。
+//  4) save() 原子写：独立临时对象 + 平台原子替换，检查 write/close；失败不删除旧缓存。
+//  5) schema=2 覆盖完整 track_health_json 字段；旧条目缓存未命中，重新分析后升级。
 #pragma once
 #include "track_health.h"
 #include "../audio/audio_loader.h"   // rta::audio::widen（UTF-8 → UTF-16，中文缓存路径必需）
+#include "../net/cache_file.h"
 #include "../net/json.h"             // rta::net::json_parse（只读解析）
 #include <filesystem>
 #include <map>
@@ -21,6 +23,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cmath>
+#include <limits>
+#include <type_traits>
 
 namespace rta::analysis {
 
@@ -55,25 +59,11 @@ public:
             const rta::net::Json& hj = e["health"];
             if (p.empty() || hj.type != rta::net::Json::Obj || hj["status"].s().empty()) { ++skipped_; continue; }
             Entry en;
-            en.mtime = (int64_t)std::llround(e["mtime"].n());
-            en.size  = (int64_t)std::llround(e["size"].n());
-            TrackHealth& h = en.health;
-            h.drDb = hj["dr_db"].n();
-            h.lufs = hj["lufs"].n();
-            h.lra = hj["lra"].n();
-            h.peakDbfs = hj["peak_dbfs"].n();
-            h.losslessSuspected = hj["lossless_suspected"].b || hj["lossless_suspected"].n() != 0.0;
-            h.cutoffHz = hj["cutoff_hz"].n();
-            h.confidence = hj["confidence"].n();
-            h.reason = hj["reason"].s();
-            h.fake24bit = hj["fake24"].b || hj["fake24"].n() != 0.0;
-            h.durationSec = hj["duration_sec"].n();
-            h.fs = (uint32_t)std::llround(hj["fs"].n());
-            h.channels = (int)std::llround(hj["channels"].n());
-            h.bits = (int)std::llround(hj["bits"].n());
-            h.status = hj["status"].s();
-            h.error = hj["error"].s();
-            h.analyzedAtMs = (int64_t)std::llround(hj["analyzed_at_ms"].n());
+            if (!read_number(e["mtime"], en.mtime) || !read_number(e["size"], en.size)) { ++skipped_; continue; }
+            // Schema 2 is the full serialized analysis contract. Legacy entries are cache misses,
+            // never fabricated measurements (e.g. missing true peak must not become measured 0).
+            if (e["schema"].type != rta::net::Json::Num || e["schema"].n() != 2 ||
+                !decode_health(hj, en.health)) { ++skipped_; continue; }
             entries_[normalize_path_key(p)] = std::move(en);
         }
     }
@@ -105,28 +95,15 @@ public:
         for (const auto& kv : entries_) {
             if (!first) data += ",";
             first = false;
-            data += "{\"path\":\"" + detail::json_escape(kv.first) + "\"";
+            data += "{\"schema\":2,\"path\":\"" + detail::json_escape(kv.first) + "\"";
             data += ",\"mtime\":" + std::to_string((long long)kv.second.mtime);
             data += ",\"size\":" + std::to_string((long long)kv.second.size);
             data += ",\"health\":" + track_health_json(kv.second.health);
             data += "}";
         }
         data += "]";
-        const std::string tmp = jsonPath_ + ".tmp";
-        if (!write_whole_file(tmp, data)) return false;
-        std::error_code ec;
-        const std::filesystem::path from = std::filesystem::path(rta::audio::widen(tmp));
-        const std::filesystem::path to   = std::filesystem::path(rta::audio::widen(jsonPath_));
-        std::filesystem::rename(from, to, ec);
-        if (ec) {
-            // 个别实现/场景 rename 不覆盖已存在目标：退化为删正身再 rename（窗口极小，可接受）
-            std::error_code ec2;
-            std::filesystem::remove(to, ec2);
-            ec.clear();
-            std::filesystem::rename(from, to, ec);
-            if (ec) { std::filesystem::remove(from, ec2); return false; }
-        }
-        return true;
+        std::string error;
+        return rta::net::cache_replace_existing(std::filesystem::u8path(jsonPath_), data, error);
     }
 
     size_t size() const { return entries_.size(); }
@@ -134,6 +111,93 @@ public:
     int skippedEntries() const { return skipped_; }   // 解析时跳过的损坏条数（非致命）
 
 private:
+    template<class T> static bool read_number(const rta::net::Json& j, T& out) {
+        if (j.type != rta::net::Json::Num) return false;
+        const long double value = j.num;
+        if (value < (long double)std::numeric_limits<T>::lowest() ||
+            value > (long double)std::numeric_limits<T>::max()) return false;
+        if constexpr (std::is_integral<T>::value) {
+            if (std::floor(value) != value || value < -9007199254740991.0L || value > 9007199254740991.0L) return false;
+        }
+        out = static_cast<T>(j.num); return true;
+    }
+    static bool read_bool(const rta::net::Json& j, bool& out) {
+        if (j.type != rta::net::Json::Bool) return false;
+        out = j.b; return true;
+    }
+    static bool read_string(const rta::net::Json& j, std::string& out) {
+        if (j.type != rta::net::Json::Str) return false;
+        out = j.str; return true;
+    }
+    static bool decode_health(const rta::net::Json& j, TrackHealth& h) {
+        const auto& q = j["quality"];
+        if (q.type != rta::net::Json::Obj) return false;
+        if (!read_number(j["dr_db"], h.drDb)) return false;
+        if (!read_number(j["lufs"], h.lufs)) return false;
+        if (!read_number(j["lra"], h.lra)) return false;
+        if (!read_number(j["peak_dbfs"], h.peakDbfs)) return false;
+        if (!read_number(j["true_peak_dbtp"], h.truePeakDbtp)) return false;
+        if (!read_number(j["cutoff_hz"], h.cutoffHz)) return false;
+        if (!read_number(j["confidence"], h.confidence)) return false;
+        if (!read_number(j["edge_db"], h.edgeDb)) return false;
+        if (!read_number(j["window_fill"], h.windowFill)) return false;
+        if (!read_number(j["duration_sec"], h.durationSec)) return false;
+        if (!read_number(j["declared_sec"], h.declaredSec)) return false;
+        if (!read_number(j["spectral_windows"], h.windows)) return false;
+        if (!read_number(j["fs"], h.fs)) return false;
+        if (!read_number(j["channels"], h.channels)) return false;
+        if (!read_number(j["bits"], h.bits)) return false;
+        if (!read_number(j["analyzed_at_ms"], h.analyzedAtMs)) return false;
+        if (!read_bool(j["lossless_suspected"], h.losslessSuspected)) return false;
+        if (!read_bool(j["fake24"], h.fake24bit)) return false;
+        if (!read_bool(j["incomplete"], h.incomplete)) return false;
+        if (!read_string(j["reason"], h.reason)) return false;
+        if (!read_string(j["status"], h.status)) return false;
+        if (!read_string(j["error"], h.error)) return false;
+        if (!read_string(j["note"], h.note)) return false;
+        if (!read_number(q["thdn_db"], h.quality.thdnDb)) return false;
+        if (!read_number(q["thdn_pct"], h.quality.thdnPct)) return false;
+        if (!read_number(q["non_tonal_db"], h.quality.nonTonalDb)) return false;
+        if (!read_number(q["imd_db"], h.quality.imdDb)) return false;
+        if (!read_number(q["noise_floor_dbfs"], h.quality.noiseFloorDbfs)) return false;
+        if (!read_number(q["spectral_min_dbfs"], h.quality.spectralMinDbfs)) return false;
+        if (!read_number(q["snr_db"], h.quality.snrDb)) return false;
+        if (!read_number(q["centroid_hz"], h.quality.centroidHz)) return false;
+        if (!read_number(q["tilt_db_per_oct"], h.quality.tiltDbPerOct)) return false;
+        if (!read_number(q["rolloff95_hz"], h.quality.rolloff95Hz)) return false;
+        if (!read_number(q["hf_ratio_10k_db"], h.quality.hfRatio10kDb)) return false;
+        if (!read_number(q["peak_dbfs_q"], h.quality.peakDbfs)) return false;
+        if (!read_number(q["rms_dbfs"], h.quality.rmsDbfs)) return false;
+        if (!read_number(q["clipped_pct"], h.quality.clippedPct)) return false;
+        if (!read_number(q["crest_db"], h.quality.crestDb)) return false;
+        if (!read_number(q["channel_corr"], h.quality.channelCorr)) return false;
+        if (!read_number(q["mono_loss_db"], h.quality.monoLossDb)) return false;
+        if (!read_number(q["side_mid_db"], h.quality.sideMidDb)) return false;
+        if (!read_number(q["dyn_p95_p10_db"], h.quality.dynP95P10Db)) return false;
+        if (!read_number(q["dyn_centroid_dbfs"], h.quality.dynCentroidDbfs)) return false;
+        if (!read_number(q["quiet_p10_dbfs"], h.quality.quietP10Dbfs)) return false;
+        if (!read_number(q["silence_pct"], h.quality.silencePct)) return false;
+        if (!read_number(q["clipped_samples"], h.quality.clippedSamples)) return false;
+        if (!read_number(q["clipped_runs"], h.quality.clippedRuns)) return false;
+        if (!read_number(q["longest_clip_run"], h.quality.longestClipRun)) return false;
+        if (!read_number(q["spectral_windows"], h.quality.spectralWindows)) return false;
+        if (!read_bool(q["thdn_available"], h.quality.thdnAvailable)) return false;
+        if (!read_bool(q["imd_available"], h.quality.imdAvailable)) return false;
+        if (!read_bool(q["stereo"], h.quality.stereo)) return false;
+        if (!read_string(q["thdn_method"], h.quality.thdnMethod)) return false;
+        if (!read_string(q["imd_note"], h.quality.imdNote)) return false;
+        if (!read_string(q["note"], h.quality.note)) return false;
+        if (!read_bool(q["available"], h.hasQuality)) return false;
+        h.quality.valid = h.hasQuality;
+        const std::string verdict = j["fake_verdict"].s();
+        if (verdict == "none") h.fakeVerdict = 0;
+        else if (verdict == "lossy") h.fakeVerdict = 1;
+        else if (verdict == "band_limited") h.fakeVerdict = 2;
+        else if (verdict == "unclear") h.fakeVerdict = 3;
+        else return false;
+        return true;
+    }
+
     struct Entry {
         int64_t mtime = 0;
         int64_t size = 0;
@@ -149,7 +213,12 @@ private:
             WIN32_FILE_ATTRIBUTE_DATA fa{};
             if (GetFileAttributesExW(rta::audio::widen(path).c_str(), GetFileExInfoStandard, &fa))
                 *err = "无法读取缓存文件（可能无权限或被占用）: " + path;
-            return false;   // 属性都查不到 = 不存在 = 空库
+            else {
+                const DWORD code = GetLastError();
+                if (code != ERROR_FILE_NOT_FOUND && code != ERROR_PATH_NOT_FOUND)
+                    *err = "无法查询缓存文件: " + path + " (" + std::to_string(code) + ")";
+            }
+            return false;
         }
         std::string data;
         char buf[65536];
@@ -162,14 +231,6 @@ private:
         if (data.empty()) { *err = "缓存文件为空（0 字节，正常不应出现）: " + path; return false; }
         *out = std::move(data);
         return true;
-    }
-
-    static bool write_whole_file(const std::string& path, const std::string& data) {
-        FILE* f = _wfopen(rta::audio::widen(path).c_str(), L"wb");
-        if (!f) return false;
-        const bool ok = std::fwrite(data.data(), 1, data.size(), f) == data.size();
-        const bool closed = (std::fclose(f) == 0);
-        return ok && closed;
     }
 
     std::string jsonPath_;

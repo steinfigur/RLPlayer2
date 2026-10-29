@@ -28,6 +28,7 @@
 // 2026-10-25（移植自协作者 mac 分支）：显式包含 —— 之前靠 MSVC STL 间接带进来，换 libc++/clang-cl 就断。
 #include <algorithm>
 #include "meta/store.h"          // MetaStore::hashOf / MetaValue / meta_path_of / meta_jesc
+#include "net/cache_file.h"
 #include "meta/year.h"           // E-14：年份清洗复用统一纯函数 pv_year4
 #include <cmath>
 #include <cstdio>
@@ -519,24 +520,12 @@ inline bool entity_from_json(const std::string& text, Entity& out) {
 // 原子写（tmp + rename）
 // ---------------------------------------------------------------------------
 
-// 与 store.h MetaStore::save / saveCover 完全同语义：
-//   ① 先写 <file>.tmp；② 写成功才 rename 覆盖；③ 写失败直接返回 false，旧文件保持原样。
+// 排他分配独立临时对象；完整 write/close 成功后才原子替换。
+// 并发 writer 不共享临时文件；任何失败均不删除旧目标。
 // 为什么不能直接覆盖写：写到一半崩溃会留下截断的 JSON，整个实体（含全部 alias）就没了。
 inline bool entity_write_atomic(const fsx::path& file, const std::string& bytes) {
-    std::error_code ec;
-    const fsx::path dir = file.parent_path();
-    if (!dir.empty()) fsx::create_directories(dir, ec);
-    fsx::path tmp = file;
-    tmp += ".tmp";
-    {
-        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
-        if (!f) return false;                       // 打不开临时文件：不动旧文件
-        f.write(bytes.data(), (std::streamsize)bytes.size());
-        if (!f) return false;                       // 写失败：不动旧文件
-    }
-    fsx::rename(tmp, file, ec);                     // 同盘 rename，原子生效
-    if (ec) { fsx::remove(tmp, ec); return false; }
-    return true;
+    std::string error;
+    return rta::net::cache_replace_existing(file, bytes, error);
 }
 
 inline bool entity_read_file(const fsx::path& file, std::string& out) {

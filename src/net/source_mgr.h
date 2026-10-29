@@ -11,6 +11,7 @@
 #pragma once
 #include "net/subsonic.h"
 #include "net/emby.h"
+#include "net/cache_file.h"
 #include "platform/path.h"          // exe 目录 / 数据目录 / UTF-8 拼接（本文件不再碰 Win32）
 #include <string>
 #include <vector>
@@ -195,22 +196,29 @@ public:
 
     // ★ 下载原始文件到缓存，返回本地路径。失败返回空串。
     std::string fetch(const std::string& id, const std::string& suffix, std::string& err) {
-        {
-            std::lock_guard<std::mutex> lk(mtx_);
-            auto it = cache_.find(id);
-            if (it != cache_.end()) {
-                std::error_code ec;
-                if (std::filesystem::exists(it->second, ec) && std::filesystem::file_size(it->second, ec) > 0)
-                    return it->second;
-            }
-        }
+        err.clear();
+        SourceConfig snapshot;
+        std::string key;
         HttpResponse r;
         {
             std::lock_guard<std::mutex> lk(mtx_);
             const SourceConfig* c = active_locked();
             if (!c) { err = "还没有启用任何流媒体服务器"; return ""; }
+            snapshot = *c;
+            // Length prefixes preserve every byte and component boundary. The key never goes on disk.
+            for (const auto& part : {snapshot.id, snapshot.kind, snapshot.base, snapshot.user,
+                                      snapshot.pass, id, suffix})
+                key += std::to_string(part.size()) + ":" + part;
+            auto it = cache_.find(key);
+            if (it != cache_.end()) {
+                std::error_code ec;
+                const auto path = std::filesystem::u8path(it->second.path);
+                const auto size = std::filesystem::file_size(path, ec);
+                if (!ec && size == it->second.size) return it->second.path;
+            }
+            // The clients and active config share this lock, so download uses precisely snapshot.
             apply_active_locked();
-            r = (c->kind == "emby") ? emby_.download(id) : sub_.download(id);
+            r = (snapshot.kind == "emby") ? emby_.download(id) : sub_.download(id);
         }
         if (!r.ok || r.body.empty()) { err = r.ok ? "下载为空" : r.error; return ""; }
 
@@ -221,23 +229,16 @@ public:
             return "";
         }
 
-        const std::string dir = cache_dir();
-        std::error_code ec;
-        std::filesystem::create_directories(dir, ec);
-
-        std::string safeId;
-        for (char c : id) safeId += (isalnum((unsigned char)c) ? c : '_');
-        std::string ext = suffix.empty() ? std::string(".audio") : ("." + suffix);
-        const auto u8p = (std::filesystem::path(dir) / (safeId + ext)).u8string();
-        const std::string path(reinterpret_cast<const char*>(u8p.data()), u8p.size());
-
-        std::ofstream f(path, std::ios::binary);
-        if (!f) { err = "无法写入缓存"; return ""; }
-        f.write((const char*)r.body.data(), (std::streamsize)r.body.size());
-        f.close();
-
+#ifdef RTA_SOURCE_TEST_FILE_OPS
+        const CacheFileOps fileOps = RTA_SOURCE_TEST_FILE_OPS;
+#else
+        const CacheFileOps fileOps;
+#endif
+        const std::string path = cache_write_new(cache_dir(), suffix, r.body.data(), r.body.size(), err, fileOps);
+        if (path.empty()) return {};
         std::lock_guard<std::mutex> lk(mtx_);
-        cache_[id] = path;
+        // A server switch while writing cannot change the identity captured before download.
+        cache_[key] = {path, r.body.size()};
         return path;
     }
 
@@ -327,7 +328,8 @@ private:
     Subsonic sub_;
     Emby emby_;
     mutable std::mutex mtx_;
-    std::map<std::string, std::string> cache_;
+    struct CachedFile { std::string path; uintmax_t size; };
+    std::map<std::string, CachedFile> cache_;
     std::string confPath_;
     // 已经下发给 sub_/emby_ 的配置（相同就不再 set_config，保住 Emby 的登录 token 缓存）
     std::string applied_kind_, applied_base_, applied_user_, applied_pass_;

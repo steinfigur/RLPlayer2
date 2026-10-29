@@ -470,6 +470,8 @@ static void test_odd_rates() {
             in.raw[i * (size_t)c.inCh] = (int32_t)std::lround(0.5 * 8388608.0 * std::sin(2.0 * 3.14159265358979 * 1000.0 * t));
         }
         auto out = p.process(in);
+        auto tail = p.finish();
+        out.raw.insert(out.raw.end(), tail.raw.begin(), tail.raw.end());
         const double expect = 48000.0;
         const double got = (double)out.frames();
         const double errPct = 100.0 * (got - expect) / expect;

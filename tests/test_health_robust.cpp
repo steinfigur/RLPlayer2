@@ -58,6 +58,7 @@ static void write_wav(const fsx::path& p, int ch, int rate, int bits, int fmt,
     put32((unsigned)(rate * ch * bytesPer)); put16((unsigned)(ch * bytesPer)); put16((unsigned)bits);
     putS("data"); put32((unsigned)dataBytes);
     std::ofstream f(p, std::ios::binary | std::ios::trunc);
+    if (!f) throw std::runtime_error("Cannot create WAV fixture: " + upath(p));
     f.write(h.data(), (std::streamsize)h.size());
     if (withSamples) {
         // 全零（数字静音）：这是最容易把 log10(0) 打成 nan/inf 的输入
@@ -69,6 +70,8 @@ static void write_wav(const fsx::path& p, int ch, int rate, int bits, int fmt,
             left -= n;
         }
     }
+    f.close();
+    if (!f) throw std::runtime_error("Incomplete WAV fixture: " + upath(p));
 }
 
 static void write_bytes(const fsx::path& p, const std::string& s) {
@@ -125,10 +128,11 @@ int main() {
 }
 
 static int run_all() {
-    g_dir = fsx::current_path() / "test_health_robust_tmp";
+    // Test the filename independently of an arbitrarily long out-of-tree build path.
+    // A unique directory also prevents one test process from erasing another's fixtures.
+    g_dir = fsx::temp_directory_path() / ("hr-" + std::to_string(GetCurrentProcessId()) + "-" + std::to_string(GetTickCount64()));
     std::error_code ec;
-    fsx::remove_all(g_dir, ec);
-    fsx::create_directories(g_dir, ec);
+    if (!fsx::create_directory(g_dir, ec)) throw std::runtime_error("Cannot allocate health fixtures");
 
     std::printf("== 1. 极端文件名 / 路径 ==\n");
     {

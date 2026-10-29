@@ -21,6 +21,7 @@
 #include "meta/cue.h"          // CUE 整轨分轨解析（仅头文件；library 侧把它变成虚拟曲目）
 #include "meta/tags_native.h"   // 原生标签快速通道（FLAC/WAV/MP3/OGG；lib_probe_one 的原生分支）
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 #include <map>
@@ -367,7 +368,8 @@ private:
     bool idxHasHeader = false;
     mutable std::string confMigratedFrom_;
     void saveIndexLocked();
-    std::string indexTextLocked() const;          // 持锁只做内存序列化（写盘放到锁外）
+    std::string indexTextLocked() const;
+    static std::string indexText(const std::vector<LibTrack>& tracks);
     LibCleanResult pruneMissingLocked();          // 扫描线程内部用：调用方已持锁 */
     void applyCleanLocked(std::vector<LibTrack>&& kept, int removed);
     const std::vector<LibAlbum>& albumVecLocked() const;
@@ -387,6 +389,7 @@ private:
     mutable std::mutex mtx_;
     std::vector<std::string> roots_;
     std::vector<LibTrack> tracks_;
+    uint64_t indexRevision_ = 0; // mtx_: rejects a scan snapshot superseded by remove/prune/load.
     mutable std::vector<LibAlbum> albums_;
     mutable bool albumsDirty_ = true;
     mutable std::map<std::string, std::pair<std::vector<unsigned char>, std::string>> coverCache_;
@@ -839,6 +842,10 @@ inline LibTrack lib_probe_iso(const std::string& file) {
 
 // 一次 ffprobe 取全部信息（比 media_info.h 的两次调用快一倍）
 inline LibTrack lib_probe_one(const std::string& file, const std::string& ffprobePath = "") {
+#ifdef RTA_LIBRARY_TEST_PROBE
+    // Deterministic worker failure/concurrency injection; absent from production builds.
+    return RTA_LIBRARY_TEST_PROBE(file);
+#endif
     LibTrack t;
     t.path = file;
     // ===================== 原生标签快速通道（调度层，2026-10-25） =====================
@@ -1065,27 +1072,14 @@ inline std::string Library::readFile(const std::string& p) {
     return s;
 }
 inline void Library::writeFile(const std::string& p, const std::string& s) {
-    const std::string tmp = p + ".tmp";
-    {
-        std::ofstream f(rta::audio::widen(tmp).c_str(), std::ios::binary | std::ios::trunc);
-        if (!f) return;
-        f.write(s.data(), (std::streamsize)s.size());
-        // ★ 2026-10-25（索引一致性审查）：必须在 flush 之后才能 rename。
-        //   旧实现出了作用域才析构 → 析构时才 flush；写盘出错时剩下的只有"截断的 tmp"，
-        //   而 rename 不看内容。这里把"写失败"变成"绝不替换旧索引"，并在 rename 前检查。
-        f.flush();
-        if (!f.good()) { f.close(); std::error_code e2; fsx::remove(p8(tmp), e2); return; }
-    }
-    std::error_code ec;
-    fsx::rename(p8(tmp), p8(p), ec);
-    // rename 不能覆盖已存在文件时（个别网络盘/杀软占用），退化为"删旧再改名"；
-    // 仍然失败就保留 tmp（不回滚旧索引 —— 旧索引比没有索引好）。
-    if (ec) {
-        std::error_code e2;
-        fsx::remove(p8(p), e2);
-        ec.clear();
-        fsx::rename(p8(tmp), p8(p), ec);
-    }
+    std::string error;
+#ifdef RTA_LIBRARY_TEST_FILE_OPS
+    const auto ops = RTA_LIBRARY_TEST_FILE_OPS;
+#else
+    const rta::net::CacheFileOps ops;
+#endif
+    if (!rta::net::cache_replace_existing(p8(p), s, error, ops))
+        throw std::runtime_error("写入曲库失败: " + error);
 }
 
 inline void Library::load() {
@@ -1268,6 +1262,7 @@ inline void Library::load() {
     {
         std::lock_guard<std::mutex> lk(mtx_);
         tracks_.swap(loaded);
+        ++indexRevision_;
         albumsDirty_ = true;
         embedMemo_.clear();            // 换了整份索引 ⟹ 内嵌封面判定必须重问
         trackCount_.store(tracks_.size());
@@ -1306,11 +1301,12 @@ inline void Library::saveIndexLocked() {
     writeFile(indexPath(), indexTextLocked());
 }
 
-// 持锁只做内存序列化；写盘由调用方在**锁外**做（扫描收尾时 3000+ 行的 tmp+rename 不该
-// 让 /api/lib/status 排在它后面 —— 261025-01 一.1「扫描时界面卡死」的一半原因就是这个锁）。
-inline std::string Library::indexTextLocked() const {
+// 索引发布与 remove/prune 同持 mtx_，保证落盘成功后切换内存且不被旧快照覆盖。
+// /api/lib/status 只读取原子计数与 msgMtx_，不等待这把索引锁。
+inline std::string Library::indexTextLocked() const { return indexText(tracks_); }
+inline std::string Library::indexText(const std::vector<LibTrack>& tracks) {
     std::string s;
-    s.reserve(tracks_.size() * 160 + 64);
+    s.reserve(tracks.size() * 160 + 64);
     // 索引格式版本：改动「扫描产出字段」时必须 +1，否则旧索引会因为 mtime+size 未变而被整份复用，
     // 新逻辑永远不生效（2026-10-23 真机踩到：加了内嵌封面判定，用户那首 cv 仍是 false）。
     // v2 = 2026-10-23 起 hasCover 同时覆盖「内嵌封面流」与「同目录封面文件」。
@@ -1321,7 +1317,7 @@ inline std::string Library::indexTextLocked() const {
     s += "#path\tmtime\tsize\talbum\talbumArtist\tartist\ttitle\ttrack\tdisc\tyear\tsr\tbits\tch\tdur\thasCover\tgenre"
          "\tcue\tcueN\tcueOff\tcueLen\n";
     char buf[256];
-    for (auto& t : tracks_) {
+    for (const auto& t : tracks) {
         s += lib_clean_field(t.path); s += '\t';
         std::snprintf(buf, sizeof(buf), "%lld\t%lld\t", t.mtime, t.size); s += buf;
         s += lib_clean_field(t.album);       s += '\t';
@@ -1867,7 +1863,8 @@ inline void Library::startScan(bool forceFull) {
     joinScan();
     const auto roots = this->roots();
     // 旧索引（增量基准）
-    std::vector<LibTrack> old = [&] { std::lock_guard<std::mutex> lk(mtx_); return tracks_; }();
+    uint64_t revision = 0;
+    std::vector<LibTrack> old = [&] { std::lock_guard<std::mutex> lk(mtx_); revision = indexRevision_; return tracks_; }();
 
     cancel_.store(false);
     scanning_.store(true);
@@ -1877,7 +1874,7 @@ inline void Library::startScan(bool forceFull) {
 
     const size_t thCount = this->scanThreads();
 
-    th_ = std::thread([this, roots, old, forceFull, thCount]() {
+    th_ = std::thread([this, roots, old, forceFull, thCount, revision]() mutable {
         // ★ 整个扫描体包一层 catch：扫描是**后台线程**，任何未捕获异常都会 std::terminate
         //   （MSVC 报 0xC0000409），进程直接消失 —— 261025-01 一.2「扫描中文路径直接卡死」
         //   就是这么发生的（根因见 p8 注释）。异常只允许降级成一条错误文案。
@@ -1907,26 +1904,23 @@ inline void Library::startScan(bool forceFull) {
             }
             if (!dead.empty()) {
                 std::unordered_map<std::string, char> deadSet;
-                deadSet.reserve(dead.size() * 2);
                 for (auto* d : dead) deadSet[*d] = 1;
-                std::string text;
-                {
-                    std::lock_guard<std::mutex> lk(mtx_);
-                    std::vector<LibTrack> kept;
-                    kept.reserve(tracks_.size());
-                    for (auto& t : tracks_) {
-                        if (deadSet.count(t.path)) { ++gone; continue; }
-                        kept.push_back(std::move(t));
-                    }
-                    if (gone > 0) {
-                        tracks_.swap(kept);
-                        albumsDirty_ = true;
-                        albumCount_.store(0);
-                        trackCount_.store(tracks_.size());
-                        text = indexTextLocked();
-                    }
+                std::lock_guard<std::mutex> lk(mtx_);
+                if (indexRevision_ != revision) throw std::runtime_error("扫描期间索引已变更，请重试扫描");
+                std::vector<LibTrack> kept;
+                kept.reserve(tracks_.size());
+                for (const auto& t : tracks_) {
+                    if (deadSet.count(t.path)) { ++gone; continue; }
+                    kept.push_back(t);
                 }
-                if (gone > 0) writeFile(indexPath(), text);
+                if (gone > 0) {
+                    writeFile(indexPath(), indexText(kept));
+                    tracks_.swap(kept);
+                    revision = ++indexRevision_;
+                    albumsDirty_ = true;
+                    albumCount_.store(0);
+                    trackCount_.store(tracks_.size());
+                }
             }
             removedMissing_.store(gone);
         }
@@ -1998,19 +1992,19 @@ inline void Library::startScan(bool forceFull) {
                     for (auto& br : badRoots)
                         if (lib_path_under(o.path, br)) { kept.push_back(o); break; }
             }
-            std::string text;
             {
                 std::lock_guard<std::mutex> lk(mtx_);
+                if (indexRevision_ != revision) throw std::runtime_error("扫描期间索引已变更，请重试扫描");
+                writeFile(indexPath(), indexText(kept));
                 tracks_.swap(kept);
+                ++indexRevision_;
                 albumsDirty_ = true;
                 albumCount_.store(0);
                 trackCount_.store(tracks_.size());
                 lastScanMs_.store(durMs);
                 lastScanProbed_.store(0);
                 lastScanCached_.store(0);
-                text = indexTextLocked();
             }
-            writeFile(indexPath(), text);          // 锁外写盘
             {
                 std::lock_guard<std::mutex> lk(msgMtx_);
                 std::string m = "完成：0 首";
@@ -2144,7 +2138,8 @@ inline void Library::startScan(bool forceFull) {
                         fresh[(size_t)i] = std::move(t2);
                         cachedCount.fetch_add(1, std::memory_order_relaxed);
                         const int c = completed.fetch_add(1, std::memory_order_relaxed) + 1;
-                        scanned_.store(c);
+                        int previous = scanned_.load();
+                while (previous < c && !scanned_.compare_exchange_weak(previous, c)) {}
                         return;
                     }
                 }
@@ -2166,14 +2161,17 @@ inline void Library::startScan(bool forceFull) {
                 fresh[(size_t)i] = std::move(t);
                 probedCount.fetch_add(1, std::memory_order_relaxed);
                 const int c = completed.fetch_add(1, std::memory_order_relaxed) + 1;
-                scanned_.store(c);
+                int previous = scanned_.load();
+                while (previous < c && !scanned_.compare_exchange_weak(previous, c)) {}
                 // 进度文案：改为**限频**（每 100ms 一次）而不是每 8 首一次 —— 3000 首时旧实现要
                 // 抢 375 次全局锁，每次都会把 /api/lib/stats 顶到后面（铁律：状态查询不该被进度文案堵住）。
-                if (c == n || std::chrono::duration<double, std::milli>(
-                                  std::chrono::steady_clock::now() - lastMsg).count() >= 100.0) {
-                    lastMsg = std::chrono::steady_clock::now();
+                {
                     std::lock_guard<std::mutex> lk(msgMtx_);
-                    scanMsg_ = "读取标签 " + std::to_string(c) + "/" + std::to_string(n);
+                    const auto now = std::chrono::steady_clock::now();
+                    if (completed.load() == n || std::chrono::duration<double, std::milli>(now - lastMsg).count() >= 100.0) {
+                        lastMsg = now;
+                        scanMsg_ = "读取标签 " + std::to_string(completed.load()) + "/" + std::to_string(n);
+                    }
                 }
             });
             if (!submitted) break;
@@ -2181,11 +2179,12 @@ inline void Library::startScan(bool forceFull) {
         }
 
         pool->wait(false);
-
         {
             std::lock_guard<std::mutex> lk(mtx_);
             activePool_.reset();
         }
+        // Join all workers before rethrowing; the outer failure handler preserves the old index.
+        pool->rethrowIfError();
 
         if (cancel_.load()) {
             scanning_.store(false);
@@ -2274,10 +2273,12 @@ inline void Library::startScan(bool forceFull) {
         int isoCount = 0;
         for (auto& t : fresh) if (t.needsConvert()) ++isoCount;
         const size_t nt = fresh.size();
-        std::string text;
         {
             std::lock_guard<std::mutex> lk(mtx_);
+            if (indexRevision_ != revision) throw std::runtime_error("扫描期间索引已变更，请重试扫描");
+            writeFile(indexPath(), indexText(fresh));
             tracks_.swap(fresh);
+            ++indexRevision_;
             albumsDirty_ = true;
             embedMemo_.clear();        // 扫描换了整份索引 ⟹ 内嵌封面判定必须重问
             lastScanMs_.store(durMs);
@@ -2288,9 +2289,7 @@ inline void Library::startScan(bool forceFull) {
             //   旧实现把这次整理推给"第一个 /api/lib/albums 请求"，而 HTTP 是单线程 ⟹ 用户
             //   点第一个标签时整站被堵住。放在扫描线程里做，交互路径就再也没有这一笔账。
             albumVecLocked();
-            text = indexTextLocked();
         }
-        writeFile(indexPath(), text);          // 锁外写盘（见 indexTextLocked 注释）
         {
             std::lock_guard<std::mutex> lk(msgMtx_);
             std::string m = "完成：" + std::to_string(nt) + " 首 (" + std::to_string((int)(durMs + 0.5)) + " ms)";
@@ -2336,8 +2335,17 @@ inline void Library::startScan(bool forceFull) {
 //   * POST /api/lib/remove?path=<dir> —— 按目录移除（含子目录）
 // ---------------------------------------------------------------------------
 inline bool lib_file_exists(const std::string& p) {
+    // This predicate gates deletion: unknown/inaccessible is retained, only confirmed absence is pruned.
     std::error_code ec;
-    try { return fsx::exists(p8(p), ec); } catch (const std::exception&) { return false; }
+    try {
+#ifdef RTA_LIBRARY_TEST_STATUS
+        const auto status = RTA_LIBRARY_TEST_STATUS(p, ec);
+#else
+        const auto status = fsx::status(p8(p), ec);
+#endif
+        if (ec) return ec != std::errc::no_such_file_or_directory && ec != std::errc::not_a_directory;
+        return status.type() != fsx::file_type::not_found;
+    } catch (const std::exception&) { return true; }
 }
 
 // 调用方须持有 mtx_。返回被剔除的条数（不落盘 —— 由调用方决定时机）
@@ -2345,12 +2353,14 @@ inline LibCleanResult Library::pruneMissingLocked() {
     std::vector<LibTrack> kept;
     kept.reserve(tracks_.size());
     int removed = 0;
-    for (auto& t : tracks_) {
-        if (lib_file_exists(t.path)) kept.push_back(std::move(t));
+    for (const auto& t : tracks_) {
+        if (lib_file_exists(t.path)) kept.push_back(t);
         else ++removed;
     }
     if (removed > 0) {
+        writeFile(indexPath(), indexText(kept));
         tracks_.swap(kept);
+        ++indexRevision_;
         albumsDirty_ = true;
         albumCount_.store(0);
         trackCount_.store(tracks_.size());
@@ -2360,64 +2370,51 @@ inline LibCleanResult Library::pruneMissingLocked() {
 }
 
 inline LibCleanResult Library::pruneMissing() {
-    LibCleanResult r;
-    std::string text;
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        r = pruneMissingLocked();
-        removedMissing_.store(r.removed);
-        if (r.removed == 0) return r;                   // 没变化就不必重写索引
-        text = indexTextLocked();
-    }
-    writeFile(indexPath(), text);
-    return r;
+    std::lock_guard<std::mutex> lk(mtx_);
+    const auto result = pruneMissingLocked();
+    removedMissing_.store(result.removed);
+    return result;
 }
 
 inline LibCleanResult Library::removeUnder(const std::string& dir) {
     LibCleanResult r;
     if (dir.empty() || !lib_valid_utf8(dir)) return r;
-    std::string text;
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        std::vector<LibTrack> kept;
-        kept.reserve(tracks_.size());
-        for (auto& t : tracks_) {
-            if (lib_path_under(t.path, dir)) { ++r.removed; continue; }
-            kept.push_back(std::move(t));
-        }
-        if (r.removed > 0) {
-            tracks_.swap(kept);
-            albumsDirty_ = true;
-            albumCount_.store(0);
-            trackCount_.store(tracks_.size());
-            text = indexTextLocked();
-        }
-        r.tracks = tracks_.size();
+    std::lock_guard<std::mutex> lk(mtx_);
+    std::vector<LibTrack> kept;
+    kept.reserve(tracks_.size());
+    for (const auto& t : tracks_) {
+        if (lib_path_under(t.path, dir)) { ++r.removed; continue; }
+        kept.push_back(t);
     }
-    if (r.removed > 0) writeFile(indexPath(), text);
+    if (r.removed > 0) {
+        writeFile(indexPath(), indexText(kept));
+        tracks_.swap(kept);
+        ++indexRevision_;
+        albumsDirty_ = true;
+        albumCount_.store(0);
+        trackCount_.store(tracks_.size());
+    }
+    r.tracks = tracks_.size();
     return r;
 }
 
 inline bool Library::removePath(const std::string& path) {
     if (path.empty()) return false;
-    std::string text;
+    std::lock_guard<std::mutex> lk(mtx_);
+    std::vector<LibTrack> kept;
+    kept.reserve(tracks_.size());
     bool hit = false;
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        std::vector<LibTrack> kept;
-        kept.reserve(tracks_.size());
-        for (auto& t : tracks_) {
-            if (!hit && lib_path_under(t.path, path) && t.path.size() == path.size()) { hit = true; continue; }
-            kept.push_back(std::move(t));
-        }
-        if (!hit) return false;
-        tracks_.swap(kept);
-        albumsDirty_ = true;
-        albumCount_.store(0);
-        trackCount_.store(tracks_.size());
-        text = indexTextLocked();
+    for (const auto& t : tracks_) {
+        if (!hit && lib_path_under(t.path, path) && t.path.size() == path.size()) { hit = true; continue; }
+        kept.push_back(t);
     }
-    writeFile(indexPath(), text);
+    if (!hit) return false;
+    writeFile(indexPath(), indexText(kept));
+    tracks_.swap(kept);
+    ++indexRevision_;
+    albumsDirty_ = true;
+    albumCount_.store(0);
+    trackCount_.store(tracks_.size());
     return true;
 }
 

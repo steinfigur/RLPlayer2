@@ -195,6 +195,7 @@ static int play_asio_dop_dsd(const AsioDriverEntry& e, const DsdStream& s, doubl
         return 5;
     }
     printf("  DoP: %s，缓冲 %ld 帧，%u Hz / 24-bit\n", dop.name().c_str(), dop.buffer_size(), carrier);
+    dop.set_dop_mode(true);
     if (!dop.start(derr)) { printf("❌ DoP ASIOStart 失败：%s\n", derr.c_str()); return 5; }
     const size_t periodFrames = (size_t)dop.buffer_size();
     const size_t totalBits = (size_t)std::min<double>((double)s.bits, playSec * (double)s.rate);
@@ -532,8 +533,10 @@ int main(int argc, char** argv) {
     bool nativeDsd = false;      // 原生 DSD（ASIO IoFormat），失败显式回落 DoP
     bool forceDop = false;       // 诊断：强制走 DoP 回落路径（验证"回落真的能出声/静音"）
 
+    std::vector<std::string> explicitOptions;
     for (int i = 2; i < argc; ++i) {
         std::string k = argv[i];
+        explicitOptions.push_back(k);
         auto next = [&](const char* def) -> std::string { return (i + 1 < argc) ? std::string(argv[++i]) : std::string(def); };
         if (k == "--device")      deviceId = next("");
         else if (k == "--rate")   cfg.outRate = (uint32_t)atoi(next("0").c_str());
@@ -606,6 +609,7 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    const auto explicitConfig = cfg;
     // ================= DirectSDM：DSD 文件 → ASIO 原生 DSD（不经过 PCM） =================
     // 为什么必须在 read_any 之前拦截：read_any 会把 .dsf 抽成 PCM（多一层量化、
     // 丢掉原始 1-bit 流），那样就谈不上"原生 DSD"了。
@@ -653,14 +657,7 @@ int main(int argc, char** argv) {
     if (!filterName.empty()) {
         const auto* fp = rta::dsp::find_preset(filterName, in.rate >= 88200);
         if (!fp) { printf("!! 未知滤波器 '%s'；用 --list-filters 查看全部\n", filterName.c_str()); return 1; }
-        cfg.taps         = fp->taps;
-        cfg.transition   = fp->transition;
-        cfg.attenDb      = fp->attenDb;
-        cfg.filterWindow = fp->window;
-        cfg.filterPhase  = fp->phase;
-        cfg.twoStage     = fp->twoStage;
-        cfg.minTapsPerInput = fp->tapsPerInput;   // 2026-10-25：每相位抽头地板（* -tight 预设靠它）
-        if (fp->twoStage && fp->stage2Taps > 0) cfg.stage2Taps = fp->stage2Taps;
+        eng::apply_filter_preset(cfg, *fp);
         printf("滤波器: %s (%d 抽头, 过渡 %.3f, 阻带 %.0f dB, %s%s)\n",
                fp->name, fp->taps, fp->transition, fp->attenDb,
                fp->phase == rta::dsp::PhaseKind::Minimum ? "最小相位" :
@@ -692,6 +689,8 @@ int main(int argc, char** argv) {
             };
             key = tr(key); val = tr(val);
             if (key.empty() || val.empty()) continue;
+            if (std::find(explicitOptions.begin(), explicitOptions.end(), "--" + key) != explicitOptions.end()) continue;
+            if (key == "rate" && std::find(explicitOptions.begin(), explicitOptions.end(), "--rate-max") != explicitOptions.end()) continue;
             if      (key == "rate"   && cfg.outRate == 0)  { cfg.outRate = (uint32_t)atoi(val.c_str()); ++applied; }
             else if (key == "bits"   && cfg.outBits == 0)  { cfg.outBits = atoi(val.c_str()); ++applied; }
             else if (key == "taps"   && cfg.taps == 65536){ cfg.taps = atoi(val.c_str()); ++applied; }
@@ -707,11 +706,7 @@ int main(int argc, char** argv) {
                 filterName = val;
                 const auto* fp = rta::dsp::find_preset(filterName, in.rate >= 88200);
                 if (fp) {
-                    cfg.taps = fp->taps; cfg.transition = fp->transition; cfg.attenDb = fp->attenDb;
-                    cfg.filterWindow = fp->window; cfg.filterPhase = fp->phase;
-                    cfg.twoStage = fp->twoStage;
-                    cfg.minTapsPerInput = fp->tapsPerInput;   // 2026-10-25：每相位抽头地板
-                    if (fp->twoStage && fp->stage2Taps > 0) cfg.stage2Taps = fp->stage2Taps;
+                    eng::apply_filter_preset(cfg, *fp);
                     ++applied;
                 }
             }
@@ -720,6 +715,9 @@ int main(int argc, char** argv) {
         }
         printf("配置: %s -> 应用 %d 项\n", configFile.c_str(), applied);
     }
+
+    // Presets establish defaults; explicit CLI values are applied after all config/preset sources.
+    if (std::find(explicitOptions.begin(), explicitOptions.end(), "--taps") != explicitOptions.end()) cfg.taps = explicitConfig.taps;
 
     // ---- 装载 EQ / 卷积 IR / Matrix ----
     if (!eqFile.empty()) {
@@ -792,6 +790,9 @@ int main(int argc, char** argv) {
     // 与现有路径的区别：先只处理【第一小块】就打开设备开始播，
     // 之后在播放循环里按需继续处理后续块。
     // 由于流式改造（Round 33/34）后分块与整块输出逐位一致，这条路径的音质与整块完全相同。
+    if (lowLat && dsdMultiple > 0) {
+        printf("--lowlat cannot bypass the DSD modulation/packing stage; use --out/--net or normal playback\n"); return 1;
+    }
     if (lowLat && netTarget.empty() && !analyzeOnly && outFile.empty()) {
         // ⚠️ 未完成：能正确"首块即开流"（首个音频写入延迟 0 ms），
         //    但实测会在约 2 个事件后停摆（供数节奏与设备消耗的配合未调通）。
@@ -835,6 +836,10 @@ int main(int argc, char** argv) {
             }
             out.raw.insert(out.raw.end(), o.raw.begin(), o.raw.end());
             done += n;
+            if (done == in.frames()) {
+                auto tail = pl.finish();
+                out.raw.insert(out.raw.end(), tail.raw.begin(), tail.raw.end());
+            }
             st = s2;
             return true;
         };
@@ -843,7 +848,7 @@ int main(int argc, char** argv) {
         //   只处理一块（约 20 ms 音频的处理量）时，设备在事件循环里等不到后续数据就欠载，
         //   而按 Round 6 的实测，欠载会让该驱动永久停止发送事件 —— 这正是之前"2 个事件后停摆"的原因。
         //   这里先建立约 4 块的领先（足够覆盖处理抖动），起播延迟仍然只有几十毫秒。
-        for (int k = 0; k < 4; ++k) if (!process_next()) break;
+        while (out.frames() < CK * 4 && done < in.frames()) if (!process_next()) break;
         printf("输出: WAVE %u Hz/%d bit, 缓冲 %zu 帧 (%.2f ms)%s\n",
                ao.rate(), ao.bits(), ao.buffer_frames(),
                (double)ao.buffer_frames() * 1000.0 / ao.rate(), ao.realigned() ? " [对齐重试]" : "");
@@ -935,6 +940,12 @@ int main(int argc, char** argv) {
                (double)total / (double)in.rate / (el > 0 ? el : 1e-9));
     }
 
+    {
+        auto tail = pl.finish();
+        out.raw.insert(out.raw.end(), tail.raw.begin(), tail.raw.end());
+        st.inFrames = in.frames(); st.outFrames = out.frames();
+    }
+
     // ---- DSD 输出（DoP 封装）：调制 -> 打包 -> 写文件 ----
     if (dsdMultiple > 0) {
         if (outFile.empty() && netTarget.empty() && asioDevice.empty()) {
@@ -950,7 +961,10 @@ int main(int argc, char** argv) {
         // 阶数：默认 5 阶；用 --mod-order 7 时若采样率不够或 Chebyshev 1-bit 会自动退回 5 阶并提示
         const int wantOrder = (modOrder > 0) ? modOrder : 5;
         mcfg.family = rta::dsp::parse_modulator_family(modFamily);
-        mcfg.levels = (mcfg.family == rta::dsp::ModulatorFamily::Ahm ? (1 << ahmBits) : 2);
+        if (mcfg.family == rta::dsp::ModulatorFamily::Ahm) {
+            printf("AHM produces multi-level samples and cannot feed 1-bit DSD/DoP\n"); return 1;
+        }
+        mcfg.levels = 2;
         const int useOrder  = rta::dsp::stable_sdm_order(wantOrder, mcfg.fs, mcfg.levels, mcfg.family);
         if (useOrder != wantOrder)
             printf("!! %d 阶调制器在 %s / DSD%d 上不稳定（实测会饱和或失稳），已自动改用 %d 阶\n",
@@ -968,7 +982,7 @@ int main(int argc, char** argv) {
                 rta::dsp::SdmModulator m(mcfg);
                 auto& v = sdm[c];
                 v.resize(out.frames());
-                for (size_t n = 0; n < out.frames(); ++n) v[n] = m.process(out.sample(n, (int)c));
+                for (size_t n = 0; n < out.frames(); ++n) v[n] = m.process_dsd(out.sample(n, (int)c));
             });
             const auto t1 = std::chrono::steady_clock::now();
             const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -997,10 +1011,12 @@ int main(int argc, char** argv) {
                    (unsigned long long)ds.bits);
             return play_asio_native_dsd(dev, ds, limitSec, forceDop);
         }
+        // The last source bit must survive even when the rate ratio leaves a partial carrier frame.
+        for (auto& v : sdm) while (v.size() % 16) v.push_back(v.size() % 2 ? -1.0 : 1.0);
         std::vector<const double*> ip;
         for (auto& v : sdm) ip.push_back(v.data());
         std::vector<int32_t> packed;
-        rta::dsp::dop_pack(ip.data(), out.channels, out.frames(), packed);
+        rta::dsp::dop_pack(ip.data(), out.channels, sdm[0].size(), packed);
 
         rta::audio::AudioBuffer dp;
         // ★ 承载率是 DSD 率除以 16（16 个 DSD 位装进 1 个 24-bit 样本）。
@@ -1038,8 +1054,8 @@ int main(int argc, char** argv) {
     if (!st.gpuStatus.empty()) printf("  GPU: %s\n", st.gpuStatus.c_str());
 
     // ---- Web 控制面（本地 HTTP + JSON API）----
+    rta::net::WebUi ui;
     if (webEnabled) {
-        rta::net::WebUi ui;
         auto plPtr = &pl; auto stPtr = &st;
         const std::string cfgPath1 = configFile, cfgPath2 = saveConfigFile;
         bool ok = ui.start(webPort, [plPtr, stPtr, cfgPath1, cfgPath2](const rta::net::HttpRequest& rq, std::string& ct) -> std::string {

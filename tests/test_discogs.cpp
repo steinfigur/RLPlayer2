@@ -26,9 +26,10 @@ using namespace rta::meta;
 namespace fsx = std::filesystem;
 
 static int g_fail = 0;
-static void ck(bool cond, const std::string& what, const std::string& detail = "") {
+static bool ck(bool cond, const std::string& what, const std::string& detail = "") {
     if (cond) std::printf("  [PASS] %s\n", what.c_str());
     else { std::printf("  [FAIL] %s  %s\n", what.c_str(), detail.c_str()); ++g_fail; }
+    return cond;
 }
 
 // ---------------------------------------------------------------------------
@@ -66,11 +67,16 @@ static const char* kFixtureSearchNormal = R"json({
       "title": "Maurice Ravel - Boléro",
       "year": "1985",
       "label": ["TELDEC"],
-      "format": ["Vinyl 12""],
+      "format": ["Vinyl 12\""],
       "country": "Germany",
       "uri": "/release/915325"
     }
   ]
+})json";
+
+// The formerly accepted malformed quote stays a rejection regression.
+static const char* kFixtureSearchMalformedQuote = R"json({
+  "results": [{"id": 915325, "format": ["Vinyl 12""]}]
 })json";
 
 static const char* kFixtureSearchMissingFields = R"json({
@@ -219,6 +225,7 @@ static const char* kFixtureLegacyVersionsCache = R"json({
 
 int main() {
     SetConsoleOutputCP(CP_UTF8);
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
     std::printf("== meta/discogs.h Discogs L4 版本推荐单元测试 ==\n");
 
     // 1. search/versions JSON 解析
@@ -226,12 +233,13 @@ int main() {
     {
         std::vector<SearchResultItem> hits;
         std::string err;
-        ck(parse_discogs_search_json(kFixtureSearchNormal, hits, &err), "正常 search JSON 解析成功");
-        ck(hits.size() == 3, "search 命中 3 条", "实际 " + std::to_string(hits.size()));
+        if (!ck(parse_discogs_search_json(kFixtureSearchNormal, hits, &err), "正常 search JSON 解析成功", err)) return 1;
+        if (!ck(hits.size() == 3, "search 命中 3 条", "实际 " + std::to_string(hits.size()))) return 1;
         ck(hits[0].id == 1820755 && hits[0].type == "master", "第 1 条为 master 类型且 id 正确");
         ck(hits[0].year == 2013, "年份解析正确", "year=" + std::to_string(hits[0].year));
         ck(hits[0].label == "Tacet", "厂牌数组第一项正确提取");
         ck(hits[0].format.find("SACD") != std::string::npos, "格式数组正确连接");
+        ck(hits[2].format == R"(Vinyl 12")", "格式内的转义引号保持原值");
         // E-5: genres 与 styles 解析断言
         ck(hits[0].genres.size() == 1 && hits[0].genres[0] == "Classical", "search 提取 genres 成功");
         ck(hits[0].styles.size() == 2 && hits[0].styles[0] == "Modern" && hits[0].styles[1] == "Impressionist", "search 提取 styles 成功");
@@ -247,9 +255,14 @@ int main() {
         std::string malErr;
         ck(!parse_discogs_search_json(kFixtureSearchMalformed, hitsMal, &malErr), "缺少 results 字段报错");
 
+        std::vector<SearchResultItem> badQuote;
+        std::string quoteError;
+        ck(!parse_discogs_search_json(kFixtureSearchMalformedQuote, badQuote, &quoteError) &&
+           badQuote.empty() && !quoteError.empty(), "未转义格式引号明确拒绝且不留下部分结果");
+
         std::vector<MasterVersionItem> vItems;
         ck(parse_discogs_versions_json(kFixtureVersionsNormal, vItems), "正常 versions JSON 解析成功");
-        ck(vItems.size() == 3, "versions 条目数为 3");
+        if (!ck(vItems.size() == 3, "versions 条目数为 3")) return 1;
         ck(vItems[0].id == 18245671 && vItems[0].year == 2012, "version id 与年份正确");
         ck(vItems[2].format.find("Blu-ray Audio") != std::string::npos, "version format 数组正确处理");
 
@@ -350,7 +363,7 @@ int main() {
         ck(work_versions_from_json(jsonStr, loaded, &loadErr), "work_versions_to_json -> work_versions_from_json round-trip 成功");
         ck(loaded.work.title == "Boléro" && loaded.work.composer == "Maurice Ravel", "作品名称与作曲家一致");
         ck(loaded.complete == true, "complete 标记无损往返");
-        ck(loaded.performances.size() == 1, "演出版本列表数量一致");
+        if (!ck(loaded.performances.size() == 1, "演出版本列表数量一致")) return 1;
         ck(loaded.performances[0].url == "https://www.discogs.com/release/915325", "版本 URL 一致");
 
         // TTL
@@ -586,7 +599,7 @@ int main() {
         WorkVersionsResult legacyRes;
         std::string legErr;
         ck(work_versions_from_json(kFixtureLegacyVersionsCache, legacyRes, &legErr), "旧格式缓存成功解析");
-        ck(legacyRes.performances.size() == 1, "条目数量正常加载");
+        if (!ck(legacyRes.performances.size() == 1, "条目数量正常加载")) return 1;
         const auto& p = legacyRes.performances[0];
         ck(p.detailFetched == false, "旧缓存缺少 detailFetched 字段时解析为 false (便于后续刷新)");
         ck(p.ensemble == "Orchestre Symphonique", "旧缓存 orchestra 字段平滑填充至 ensemble: " + p.ensemble);

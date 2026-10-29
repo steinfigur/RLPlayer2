@@ -165,14 +165,20 @@ static std::string plain_chat_json(const std::string& content, int totalTokens =
            "\"total_tokens\":" + std::to_string(totalTokens) + "}}";
 }
 
-// 按字节切成 n 段（切点可能落在 UTF-8 中间 —— 专治"按字符切"的拼接 bug）
-static std::vector<std::string> split_bytes(const std::string& s, size_t n) {
+// Every SSE event is a self-contained UTF-8 JSON value: split content only at codepoint boundaries.
+// Network transport chunks remain arbitrary bytes (the 3-byte and 11-byte sink loops below).
+static std::vector<std::string> split_utf8_events(const std::string& s, size_t n) {
+    std::vector<size_t> boundaries{0};
+    for (size_t i = 1; i < s.size(); ++i)
+        if ((static_cast<unsigned char>(s[i]) & 0xc0) != 0x80) boundaries.push_back(i);
+    boundaries.push_back(s.size());
+    const size_t codepoints = boundaries.size() - 1;
     std::vector<std::string> out;
     if (n == 0) n = 1;
     for (size_t i = 0; i < n; ++i) {
-        const size_t b = s.size() * i / n;
-        const size_t e = s.size() * (i + 1) / n;
-        out.push_back(s.substr(b, e - b));
+        const size_t begin = boundaries[codepoints * i / n];
+        const size_t end = boundaries[codepoints * (i + 1) / n];
+        out.push_back(s.substr(begin, end - begin));
     }
     return out;
 }
@@ -671,7 +677,7 @@ int main() {
     const std::string stream_usage = meta_string_of(stream_tmp / "llm-usage.json");
     {
         const std::string full = "流式摘要：ZARD 是以坂井泉水为核心的摇滚乐队。第一段。第二段。结束。";
-        const std::vector<std::string> pieces = split_bytes(full, 5);
+        const std::vector<std::string> pieces = split_utf8_events(full, 5);
         std::string sse;
         for (const auto& p : pieces) sse += sse_delta(p);
         sse += sse_stop(30);
@@ -824,7 +830,7 @@ int main() {
                                "data: {\"choices\":[{\"delta\":{\"content\":\"断了");
             }
             std::string s;
-            for (const auto& p : split_bytes(good, 4)) s += sse_delta(p);
+            for (const auto& p : split_utf8_events(good, 4)) s += sse_delta(p);
             s += sse_stop(40);
             s += "data: [DONE]\n\n";
             return resp_ok(s);
@@ -868,7 +874,7 @@ int main() {
         }
 
         std::string sse;
-        for (const auto& p : split_bytes(kSynthesis, 5)) sse += sse_delta(p);
+        for (const auto& p : split_utf8_events(kSynthesis, 5)) sse += sse_delta(p);
         sse += sse_stop(120);
         sse += "data: [DONE]\n\n";
 
@@ -967,7 +973,7 @@ int main() {
                                    "data: {\"choices\":[{\"delta\":{\"content\":\"断");
                 }
                 std::string s;
-                for (const auto& p : split_bytes(synthesis2, 4)) s += sse_delta(p);
+                for (const auto& p : split_utf8_events(synthesis2, 4)) s += sse_delta(p);
                 s += sse_stop(120);
                 s += "data: [DONE]\n\n";
                 return resp_ok(s);
@@ -1027,7 +1033,7 @@ int main() {
   "citations": [{"id": "c1", "title": "StreamThread", "url": "https://zh.wikipedia.org/wiki/StreamThread", "source": "wikipedia-zh", "fetched_at": 1792690000}]
 })json";
         std::string sse;
-        for (const auto& p : split_bytes(synthesis3, 5)) sse += sse_delta(p);
+        for (const auto& p : split_utf8_events(synthesis3, 5)) sse += sse_delta(p);
         sse += sse_stop(90);
         sse += "data: [DONE]\n\n";
 

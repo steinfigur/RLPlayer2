@@ -46,6 +46,7 @@ struct OutSink {
     virtual bool   open(const SinkOpenOpts& opts, uint32_t rate, int ch, int bits) = 0;
     virtual bool   start() = 0;
     virtual size_t buffer_frames() const = 0;
+    virtual void   set_dop_mode(bool) {}
     virtual void   set_live_gain_db(double) {}
     // 返回 true = 真的等到了设备事件（超时/共享模式返回 false）。
     // 2026-10-24 C2：返回值只用于 STAT 的 ev/evint 遥测，调用方可以忽略（旧实现是 void）。
@@ -132,6 +133,7 @@ struct RenderHost {
     std::atomic<double>*    volDb    = nullptr;
     std::atomic<double>*    startDb  = nullptr;
     std::atomic<long long>* dbgPad   = nullptr;
+    std::mutex*             gpuMutex = nullptr;
     bool*                   gpuOut   = nullptr;   // ps.gpu（普通 bool：只在渲染线程写）
 
     // ---- 队列 ----
@@ -268,11 +270,14 @@ inline double render_now_sec() {
 // 从队列取块 → 20ms 轮询设备水位 → 补满设备缓冲。行为与抽出前逐行一致。
 inline void render_loop(OutSink& sink, RenderHost& h) {
     auto& RQ = *h.rq;
+    sink.set_dop_mode(h.dop);
+    uint64_t dopWritten = 0;
     // period 从 const 改成可变：C1 的 L2 起播看门狗降级后重开 20ms，缓冲帧数会变，
     // 必须重取（旧实现只在起播时取一次）。
     size_t period = sink.buffer_frames() ? sink.buffer_frames() : 9600;
     std::vector<int32_t> pend;
     size_t pendFrames = 0;
+    size_t pendSourceFrames = 0;  // Device-block padding never advances source progress.
     size_t played = 0;
     int timeouts = 0;
     // 「这一串连续写不进去」的起点（timeouts 0→1 时记）。
@@ -382,6 +387,7 @@ inline void render_loop(OutSink& sink, RenderHost& h) {
             if (!b.raw.empty()) {
                 pend.insert(pend.end(), b.raw.begin(), b.raw.end());
                 pendFrames += b.frames();
+                pendSourceFrames += b.frames();
                 if (h.dbgPulls) h.dbgPulls->fetch_add(1);
             }
             RQ.cv.notify_all();
@@ -422,9 +428,17 @@ inline void render_loop(OutSink& sink, RenderHost& h) {
             // 不要调用 IAudioClient::Reset()：实测 Reset+Start 之后 GetCurrentPadding
             // 会一直停在满值，GetBuffer 永远拿不到空间，表现为"跳转后进度卡住"。
             // 代价是设备缓冲里最多 1 个周期（≈100 ms）的旧音频会先播完，可接受。
-            myEpoch = RQ.epoch.fetch_add(1) + 1;
-            RQ.seekFrame.store((long long)(sk * (double)h.inFrames));
-            pend.clear(); pendFrames = 0; eos = false; padded = false;
+            {
+                // Publish the target and its epoch as one request. A completed
+                // producer epoch becomes active again before the consumer reads EOF.
+                std::lock_guard<std::mutex> lk(RQ.mtx);
+                myEpoch = RQ.epoch.fetch_add(1) + 1;
+                RQ.seekFrame.store((long long)(sk * (double)h.inFrames));
+                RQ.done = false;
+                RQ.q.clear();
+            }
+            RQ.cv.notify_all();
+            pend.clear(); pendFrames = 0; pendSourceFrames = 0; eos = false; padded = false;
             played = (size_t)(sk * (double)h.totalOut);
             h.played->store(played);
             timeouts = 0;
@@ -435,11 +449,14 @@ inline void render_loop(OutSink& sink, RenderHost& h) {
             rateArmed = false; rateDone = false; rateSupplyLimited = false; hangN = 0;
             continue;
         }
-        if (RQ.gpu.load() && !*h.gpuOut) *h.gpuOut = true;
+        if (RQ.gpu.load() && h.gpuOut) {
+            if (h.gpuMutex) { std::lock_guard<std::mutex> lk(*h.gpuMutex); *h.gpuOut = true; }
+            else *h.gpuOut = true;
+        }
 
         // 实时音量：只把「当前请求 - 起播时已应用的」这个差值交给设备层，
         // 差值为 0 时完全走原路径（逐位不变）
-        sink.set_live_gain_db(h.volDb->load() - h.startDb->load());
+        sink.set_live_gain_db(h.dop ? 0.0 : h.volDb->load() - h.startDb->load());
 
         // 先把待写缓冲填到至少一个周期（最多预攒 3 个周期，避免占内存）
         while (pendFrames < period * 3 && !eos) {
@@ -450,9 +467,22 @@ inline void render_loop(OutSink& sink, RenderHost& h) {
         //   就能把整个周期写走，pad 后 pendFrames 立即归零退出；共享模式每 20ms 只腾出
         //   ≈20ms 空间，pendFrames 落回 period 以下若再次补齐，就会每 tick 凭空多出一段
         //   静音、0.5 秒的文件永远播不完（实测 pos 冲到 200 秒还在写）。
-        if (eos && pendFrames > 0 && pendFrames < period && !padded) {
-            pend.resize(period * (size_t)h.outCh, 0);
-            pendFrames = period;
+        if (eos && pendFrames > 0 && !padded) {
+            const size_t oldFrames = pendFrames;
+            const size_t remainder = (writtenTotal + pendFrames) % period;
+            const size_t paddedFrames = pendFrames + (remainder ? period - remainder : 0);
+            pend.resize(paddedFrames * (size_t)h.outCh, 0);
+            if (h.dop) {
+                for (size_t n = oldFrames; n < paddedFrames; ++n)
+                    for (int c = 0; c < h.outCh; ++c) {
+                        const uint32_t prev = (uint32_t)pend[(n - 1) * (size_t)h.outCh + (size_t)c];
+                        const uint32_t marker = ((prev >> 16) & 255u) == 0x05u ? 0xFAu : 0x05u;
+                        uint32_t value = (marker << 16) | 0x6969u;
+                        if (value & 0x800000u) value |= 0xFF000000u;
+                        pend[n * (size_t)h.outCh + (size_t)c] = (int32_t)value;
+                    }
+            }
+            pendFrames = paddedFrames;
             padded = true;
         }
         if (pendFrames == 0 && eos) { h.normalEnd = true; break; }
@@ -532,7 +562,19 @@ inline void render_loop(OutSink& sink, RenderHost& h) {
         // 新时序下一轮最多调用两次，若仍按轮计，zp（按调用）会大于 w0，M4 的
         // 「zp+zs+zo == w0」就不成立（真机现场 19925 vs 9693 就是这么来的）。
         auto attemptWrite = [&]() -> size_t {
+            if (h.dop) {
+                // The render owner assigns markers at the device boundary. Producer
+                // epochs may be discarded on seek; they cannot own device phase.
+                for (size_t n = 0; n < pendFrames; ++n)
+                    for (int c = 0; c < h.outCh; ++c) {
+                        uint32_t value = (uint32_t)pend[n * (size_t)h.outCh + (size_t)c] & 0xFFFFu;
+                        value |= (((dopWritten + n) & 1u) ? 0xFAu : 0x05u) << 16;
+                        if (value & 0x800000u) value |= 0xFF000000u;
+                        pend[n * (size_t)h.outCh + (size_t)c] = (int32_t)value;
+                    }
+            }
             const size_t got = sink.write_available(pend.data(), pendFrames);
+            if (h.dop) dopWritten += got;
             if (got > 0) h.dbgWr->fetch_add(1); else h.dbgW0->fetch_add(1);
             return got;
         };
@@ -629,7 +671,9 @@ inline void render_loop(OutSink& sink, RenderHost& h) {
         if (w > 0) {
             pend.erase(pend.begin(), pend.begin() + (long long)(w * (size_t)h.outCh));
             pendFrames -= w;
-            played += w;
+            const size_t sourceWritten = std::min(w, pendSourceFrames);
+            pendSourceFrames -= sourceWritten;
+            played += sourceWritten;
             writtenTotal += w;
             h.played->store(played);
             timeouts = 0;

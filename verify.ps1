@@ -14,23 +14,18 @@ function Step($n, $ok, $d) { $script:rows += [pscustomobject]@{ Item=$n; Result=
 function Get-FreePort { $l = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, 0); $l.Start(); $p = $l.LocalEndpoint.Port; $l.Stop(); return $p }
 Write-Host '=== RLPlayer self-check (silent: no audio device opened) ==='
 
-# 1 build
-$null = cmake -G Ninja -S $Root -B $B -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER='C:/Program Files/AMD/ROCm/7.2/bin/clang++.exe' 2>&1
-$bo = (cmake --build $B 2>&1 | Out-String)
-# 只认真正的编译错误（源码注释里出现 ERROR 字样不该算失败）
-$errs = (($bo -split ([char]10)) | Select-String -Pattern 'error:|error generated|ninja: build stopped' | Measure-Object).Count
-Step 'CMake build' ($errs -eq 0) ($errs.ToString() + ' errors')
-
-# 2 test suite (judge by exit code, not by parsing text)
-Push-Location $B
-$ct = (ctest 2>&1 | Out-String)
-$ctExit = $LASTEXITCODE
-Pop-Location
-$sum = ((($ct -split ([char]10)) | Select-String 'tests passed' | Select-Object -First 1) -join ' ').Trim()
-if (-not $sum) { $sum = 'exit=' + $ctExit }
-$ntest = 0
-if ($sum -match 'out of (\d+)') { $ntest = [int]$Matches[1] }
-Step ('Test suite (' + $ntest + ')') ($ctExit -eq 0) $sum
+# 1/2: stop immediately on a failed configure/build; stale binaries are never tested.
+. (Join-Path $Root 'tools\verification_gates.ps1')
+try {
+  Invoke-CheckedBuild -Root $Root -Build $B -Compiler 'C:/Program Files/AMD/ROCm/7.2/bin/clang++.exe'
+  Step 'CMake build' $true 'configure=0 build=0'
+  $testResult = Invoke-CheckedTests -Build $B
+  Step ('Test suite (' + $testResult.Total + ')') $true ($testResult | ConvertTo-Json -Compress)
+} catch {
+  Step 'Build / test gate' $false $_.Exception.Message
+  $rows | Format-Table -AutoSize
+  exit 1
+}
 
 # 3 GPU library (multi-arch fat binary: every AMD family the compiler can target)
 $dll = Join-Path $B 'rtagpu.dll'
@@ -64,9 +59,10 @@ if ((Test-Path $play) -and (Test-Path $rx) -and (Test-Path $cmp)) {
   $td = Join-Path $B 'testdata'; New-Item -ItemType Directory -Force -Path $td | Out-Null
   $src = Join-Path $td 'vfy_src.wav'; $dst = Join-Path $td 'vfy_rx.wav'
   $null = & $play --gen $src 3 44100 24 2>&1
-  $job = Start-Job -ScriptBlock { param($e, $o) & $e --sink file --out $o --ctrl-port 45901 --seconds 9 2>&1 } -ArgumentList $rx, $dst
+  $netCtrl = Get-FreePort
+  $job = Start-Job -ScriptBlock { param($e, $o, $p) & $e --sink file --out $o --ctrl-port $p --seconds 9 2>&1 } -ArgumentList $rx, $dst, $netCtrl
   Start-Sleep -Seconds 2
-  $null = & $play $src --net '127.0.0.1:45901' 2>&1
+  $null = & $play $src --net ('127.0.0.1:' + $netCtrl) 2>&1
   Wait-Job $job -Timeout 25 | Out-Null
   Stop-Job $job -ErrorAction SilentlyContinue; Remove-Job $job -Force -ErrorAction SilentlyContinue
   $c = (& $cmp $src $dst 2>&1 | Out-String)
@@ -84,26 +80,75 @@ if (Test-Path $grt) {
   Step 'GPU resample kernel' $okR $l
 } else { Step 'GPU resample kernel' $false 'gpu_resample_test.exe missing' }
 
-# 8 UI self-check (headless Edge + CDP; never plays audio)
+# 8 UI self-check (headless Edge + CDP, isolated application/state; never plays audio)
 $nodeCmd = Get-Command node -ErrorAction SilentlyContinue
-if ($nodeCmd -and (Test-Path (Join-Path $Root 'tools\uicheck.js'))) {
-  $psi = New-Object System.Diagnostics.ProcessStartInfo
+$uiSafe = Join-Path $Root 'tools\uicheck-safe.ps1'
+if ($nodeCmd -and (Test-Path -LiteralPath $uiSafe) -and (Test-Path -LiteralPath (Join-Path $B 'rtaweb.exe'))) {
+  $uiSandbox = Join-Path $env:TEMP ('rta_uicheck_vfy_' + [guid]::NewGuid().ToString('N'))
+  $wp = $null
+  $uiStarted = $false
+  $uiOwnedListener = $false
   $uiPort = Get-FreePort
-  $psi.FileName = Join-Path $B 'rtaweb.exe'; $psi.Arguments = "--port $uiPort"
-  $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.CreateNoWindow = $true
-  $wp = New-Object System.Diagnostics.Process; $wp.StartInfo = $psi; $null = $wp.Start()
-  $up = $false
-  for ($i = 0; $i -lt 60; $i++) { Start-Sleep -Milliseconds 200
-    try { $t = New-Object Net.Sockets.TcpClient; $t.Connect('127.0.0.1', $uiPort); $t.Close(); $up = $true; break } catch {}
-    if ($wp.HasExited) { break } }
-  if ($up) {
-    $uo = (& node (Join-Path $Root 'tools\uicheck.js') "http://127.0.0.1:$uiPort/" (Join-Path $env:TEMP 'rta_uicheck_vfy') 2>&1 | Out-String)
-    $uiExit = $LASTEXITCODE
-    $ul = ((($uo -split ([char]10)) | Select-String '全部通过|项失败' | Select-Object -First 1) -join ' ').Trim()
-    Step 'Web UI self-check' ($uiExit -eq 0) $ul
-  } else { Step 'Web UI self-check' $false ('rtaweb did not start on port ' + $uiPort + $(if ($wp.HasExited) { '（进程已退出，可能端口被占用或启动即崩）' } else { '（30s 内未监听）' })) }
-  Stop-Process -Id $wp.Id -Force -ErrorAction SilentlyContinue
-} else { Step 'Web UI self-check' $false 'node or uicheck.js missing' }
+  try {
+    New-Item -ItemType Directory -Path $uiSandbox -ErrorAction Stop | Out-Null
+    foreach ($leaf in @('library', 'tmp', 'data')) {
+      New-Item -ItemType Directory -Path (Join-Path $uiSandbox $leaf) -ErrorAction Stop | Out-Null
+    }
+    # Copy executable assets only. Never copy user queues, settings or credentials.
+    Copy-Item -LiteralPath (Join-Path $B 'rtaweb.exe') -Destination $uiSandbox -ErrorAction Stop
+    foreach ($tool in @('ffmpeg.exe', 'ffprobe.exe')) {
+      if (Test-Path -LiteralPath (Join-Path $B $tool)) { Copy-Item -LiteralPath (Join-Path $B $tool) -Destination $uiSandbox -ErrorAction Stop }
+    }
+    $opra = Join-Path $Root 'data\opra_index.json'
+    if (Test-Path -LiteralPath $opra) { Copy-Item -LiteralPath $opra -Destination (Join-Path $uiSandbox 'data') -ErrorAction Stop }
+    [IO.File]::WriteAllText((Join-Path $uiSandbox 'rlplayer-settings.conf'),
+      "backend=null`nvolume=-60`nmetaon=0`nmetallm=0`nmetasummary=0`nroomcorrauto=0`ngpuvendor=off`n", [Text.UTF8Encoding]::new($false))
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = Join-Path $uiSandbox 'rtaweb.exe'; $psi.Arguments = "--port $uiPort"
+    $psi.WorkingDirectory = $uiSandbox
+    $psi.EnvironmentVariables['RLPLAYER_LIBRARY_DIR'] = Join-Path $uiSandbox 'library'
+    $psi.EnvironmentVariables['RLPLAYER_UPDATE_DIR'] = $uiSandbox
+    $psi.EnvironmentVariables['TEMP'] = Join-Path $uiSandbox 'tmp'
+    $psi.EnvironmentVariables['TMP'] = Join-Path $uiSandbox 'tmp'
+    $psi.EnvironmentVariables['PATH'] = $B + ';' + $env:PATH
+    $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+    $wp = New-Object System.Diagnostics.Process; $wp.StartInfo = $psi
+    if (-not $wp.Start()) { throw 'isolated rtaweb process did not start' }
+    $uiStarted = $true
+    $uiReady = $false
+    $uiReadyError = "owned listener has not appeared"
+    for ($i = 0; $i -lt 60; $i++) { Start-Sleep -Milliseconds 200
+      try {
+        $t = New-Object Net.Sockets.TcpClient; $t.Connect('127.0.0.1', $uiPort); $t.Close()
+        $listeners = @(Get-NetTCPConnection -LocalPort $uiPort -State Listen -ErrorAction Stop | Where-Object { $_.OwningProcess -eq $wp.Id })
+        if ($listeners.Count -gt 0 -and -not $wp.HasExited) { $uiOwnedListener = $true; $uiReady = $true; break }
+        $uiReadyError = "listener is not owned by test pid " + $wp.Id
+      } catch { $uiReadyError = $_.Exception.Message }
+      if ($wp.HasExited) { break }
+    }
+    if ($uiReady) {
+      $uo = (& powershell -NoProfile -ExecutionPolicy Bypass -File $uiSafe -Url "http://127.0.0.1:$uiPort/" -ExeDir $uiSandbox -RepoRoot $Root 2>&1 | Out-String)
+      $uiExit = $LASTEXITCODE
+      $ul = ((($uo -split ([char]10)) | Select-String '全部通过|项失败' | Select-Object -First 1) -join ' ').Trim()
+      Step 'Web UI self-check (isolated)' ($uiExit -eq 0) ($ul + ' sandbox=' + $uiSandbox)
+    } else { Step 'Web UI self-check (isolated)' $false ('isolated listener not verified on port ' + $uiPort + ': ' + $uiReadyError + '; sandbox=' + $uiSandbox) }
+  } catch { Step 'Web UI self-check (isolated)' $false $_.Exception.Message }
+  finally {
+    if ($wp) {
+      if ($uiStarted -and -not $wp.HasExited) {
+        # Do not send a state-changing request to a port now owned by another process.
+        try {
+          $listeners = @(Get-NetTCPConnection -LocalPort $uiPort -State Listen -ErrorAction Stop | Where-Object { $_.OwningProcess -eq $wp.Id })
+          if ($uiOwnedListener -and $listeners.Count -gt 0) {
+            $null = Invoke-WebRequest -Uri "http://127.0.0.1:$uiPort/api/quit" -Method Post -UseBasicParsing -TimeoutSec 5
+          }
+        } catch {}
+        if (-not $wp.WaitForExit(5000)) { Step 'Isolated UI shutdown' $false ('owned test server did not exit; pid=' + $wp.Id + '; sandbox=' + $uiSandbox) }
+      }
+      $wp.Dispose()
+    }
+  }
+} else { Step 'Web UI self-check (isolated)' $false 'node, uicheck-safe.ps1 or rtaweb.exe missing' }
 
 # 9 DSD domain: material generation -> DirectSDM bit-exact -> integrator THD+N
 $mk = Join-Path $B 'make_dsd.exe'; $dc = Join-Path $B 'dsdconv.exe'
@@ -119,40 +164,17 @@ if ((Test-Path $mk) -and (Test-Path $dc)) {
   Step 'DSD path (DirectSDM + THD+N)' (($dcExit -eq 0) -and $bitOk -and ($thd -ge 80.0)) ('DirectSDM bit-exact=' + $bitOk + ', THD+N ' + $thd + ' dB')
 } else { Step 'DSD path (DirectSDM + THD+N)' $false 'make_dsd/dsdconv missing' }
 
-# 10 DirectSDM end-to-end: 播放器 -> RTANet -> 文件，收到的 DoP 载波必须与源逐位一致
-# 为什么单独做：前面第 9 项只验「工具链」；这一项走的是真正的播放线程（/api/play -> OutSink）。
-if ((Test-Path $mk) -and (Test-Path $dc) -and (Test-Path (Join-Path $B 'rtanet_rx.exe')) -and (Test-Path (Join-Path $B 'wavcmp.exe'))) {
-  $td = Join-Path $B 'testdata'
-  $dsf2 = Join-Path $td 'vfy_dm.dsf'; $refW = Join-Path $td 'vfy_dm_ref.wav'; $recvW = Join-Path $td 'vfy_dm_recv.wav'
-  Remove-Item $recvW -ErrorAction SilentlyContinue
-  $null = & $mk --out $dsf2 --seconds 1 2>&1
-  $null = & $dc --in $dsf2 --direct --out $refW 2>&1
-  # 端口动态取：固定端口会被上次残留的实例占住（见文件头 Get-FreePort 的注）
-  $dmPort = Get-FreePort
-  $dmCtrl = Get-FreePort
-  $rxJob = Start-Process -FilePath (Join-Path $B 'rtanet_rx.exe') -ArgumentList @('--sink','file','--out',$recvW,'--ctrl-port',"$dmCtrl",'--seconds','8') -PassThru -WindowStyle Hidden
-  $webP = Start-Process -FilePath (Join-Path $B 'rtaweb.exe') -ArgumentList @('--port',"$dmPort") -PassThru -WindowStyle Hidden
-  $ready = $false
-  for ($i = 0; $i -lt 50; $i++) { Start-Sleep -Milliseconds 200
-    try { $t = New-Object Net.Sockets.TcpClient; $t.Connect('127.0.0.1', $dmPort); $t.Close(); $ready = $true; break } catch {}
-    if ($webP.HasExited) { break } }
-  if ($ready) {
-    $body = 'file=' + [uri]::EscapeDataString($dsf2) + '&backend=naa&naahost=127.0.0.1%3A' + $dmCtrl + '&dsd=64&volume=0&directsdm=1'
-    try { $null = Invoke-WebRequest -Uri ("http://127.0.0.1:$dmPort/api/play") -Method Post -Body $body -ContentType 'application/x-www-form-urlencoded' -UseBasicParsing -TimeoutSec 10 } catch {}
-    try { Wait-Process -Id $rxJob.Id -Timeout 20 -ErrorAction SilentlyContinue } catch {}
-  }
-  # 只停自己启动的两个进程，且校验映像名（铁律 2）
-  foreach ($pp in @($rxJob, $webP)) {
-    if ($pp) { $x = Get-Process -Id $pp.Id -ErrorAction SilentlyContinue
-      if ($x -and ($x.ProcessName -eq 'rtaweb' -or $x.ProcessName -eq 'rtanet_rx')) { Stop-Process -Id $pp.Id -ErrorAction SilentlyContinue } }
-  }
-  $cmpOut = ''
-  if (Test-Path $recvW) { $cmpOut = (& (Join-Path $B 'wavcmp.exe') $refW $recvW --prefix 2>&1 | Out-String); $cmpExit = $LASTEXITCODE } else { $cmpExit = 1 }
-  $dmDetail = ((($cmpOut -split ([char]10)) | Select-String '帧|前缀|不一致|逐位') -join ' ').Trim()
-  if (-not $ready) { $dmDetail = 'rtaweb 未在端口 ' + $dmPort + ' 监听' + $(if ($webP.HasExited) { '（进程已退出）' } else { '' }) }
-  Step 'DirectSDM e2e (NAA -> file)' ($ready -and ($cmpExit -eq 0)) $dmDetail
-} else { Step 'DirectSDM e2e (NAA -> file)' $false 'exe missing' }
-
+# 10 Removed backend rejection: actual handlers in the audit application's Null-only sandbox.
+# NAA has been removed. It must return 400 before sink creation; it is not a GUI network output.
+# RTANet bit-exact remains covered by section 6; DirectSDM tools remain covered by section 9.
+$appAudit = Join-Path $Root 'tests\test_audit_app.js'
+if ($nodeCmd -and (Test-Path -LiteralPath $appAudit)) {
+  $auditRoot = Join-Path $env:TEMP ('rta_removed_backend_vfy_' + [guid]::NewGuid().ToString('N'))
+  $ao = (& node $appAudit $B $auditRoot 2>&1 | Out-String)
+  $auditExit = $LASTEXITCODE
+  $auditLine = ((($ao -split ([char]10)) | Select-String '\[PASS\] actual app checks=' | Select-Object -First 1) -join ' ').Trim()
+  Step 'Removed backend rejected (Null-isolated app)' (($auditExit -eq 0) -and ($auditLine.Length -gt 0)) ($auditLine + ' sandbox=' + $auditRoot)
+} else { Step 'Removed backend rejected (Null-isolated app)' $false 'node or test_audit_app.js missing' }
 
 # 11 distribution compatibility: static CRT, subsystem <= 6.1, no AVX-512
 $cc = Join-Path $Root 'tools\check_compat.ps1'

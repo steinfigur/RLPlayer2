@@ -197,7 +197,7 @@ int main() {
         check(tailOk, "末 3 位也一致（打包时未丢位）");
     }
 
-    printf("\n=== 3. DFF：2 声道 / 大端 / 声道独立存放 / CHNL 声道 ID ===\n");
+    printf("\n=== 3. DFF：2 声道 / 大端 / 逐字节声道交错 / CHNL 声道 ID ===\n");
     {
         const uint64_t bits = 8ull * 8192;
         DsdStream a = make_stream(2822400u, 2, bits, 424242);
@@ -215,7 +215,7 @@ int main() {
         check(same_bits(a, b, bits, &why), "读回的 1-bit 流逐位一致", why);
 
         // 独立核对：按 DSDIFF 块链表走到 "DSD " 块（不能直接找 "DSD "，
-        // 因为 FRM8 的 form type 与 CMPR 的压缩类型也都是 "DSD "），按声道连续排列检查
+        // 因为 FRM8 的 form type 与 CMPR 的压缩类型也都是 "DSD "），按逐字节声道交错排列检查
         const auto raw = slurp(pDff);
         bool layoutOk = false;
         size_t off = 16;
@@ -227,7 +227,7 @@ int main() {
                 layoutOk = (sz == bits / 8 * 2);
                 const uint8_t* body = raw.data() + off + 12;
                 for (size_t i = 0; layoutOk && i < bits / 8; i += 331)
-                    if (body[i] != a.data[0][i] || body[bits / 8 + i] != a.data[1][i]) layoutOk = false;
+                    if (body[i * 2] != a.data[0][i] || body[i * 2 + 1] != a.data[1][i]) layoutOk = false;
                 break;
             }
             off += 12 + (size_t)sz + (size_t)(sz & 1);

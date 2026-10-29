@@ -12,6 +12,15 @@ using namespace rta::engine;
 using rta::audio::AudioBuffer;
 using rta::dsp::Shaper;
 
+// A finite source ends only after the pipeline has emitted its delayed content.
+static AudioBuffer complete(Pipeline& pl, const AudioBuffer& in, PipelineStats* st) {
+    auto out = pl.process(in, st);
+    auto tail = pl.finish();
+    out.raw.insert(out.raw.end(), tail.raw.begin(), tail.raw.end());
+    if (st) st->outFrames = out.frames();
+    return out;
+}
+
 static int fails = 0;
 static void check(bool ok, const std::string& what, const std::string& detail = "") {
     printf("  [%s] %s %s\n", ok ? "PASS" : "FAIL", what.c_str(), detail.c_str());
@@ -73,7 +82,7 @@ static int run_tests() {
             PipelineConfig cfg;                    // 全部默认 = 不升频、不整形
             Pipeline pl(cfg);
             PipelineStats st;
-            auto o = pl.process(a, &st);
+            auto o = complete(pl, a, &st);
             bool same = st.bitPerfect && (o.raw.size() == a.raw.size());
             if (same) for (size_t i = 0; i < a.raw.size(); ++i) if (a.raw[i] != o.raw[i]) { same = false; break; }
             char buf[96]; std::snprintf(buf, sizeof(buf), "(%d-bit, %zu 样本)", bits, a.raw.size());
@@ -87,7 +96,7 @@ static int run_tests() {
         PipelineConfig cfg; cfg.outBits = 24;
         Pipeline pl(cfg);
         PipelineStats st;
-        auto o = pl.process(a, &st);
+        auto o = complete(pl, a, &st);
         bool ok = st.zeroPad && (o.raw.size() == a.raw.size());
         size_t bad = 0;
         if (ok) for (size_t i = 0; i < a.raw.size(); ++i)
@@ -105,7 +114,7 @@ static int run_tests() {
         cfg.shaper = Shaper::None;
         Pipeline pl(cfg);
         PipelineStats st;
-        auto o = pl.process(a, &st);
+        auto o = complete(pl, a, &st);
         char buf[160];
         std::snprintf(buf, sizeof(buf), "(%zu -> %zu 帧, 每相位 %d 抽头, 群延迟 %.3f 输入样本)",
                       st.inFrames, st.outFrames, st.tapsPerPhase, st.latencyInSamples);
@@ -174,7 +183,7 @@ static int run_tests() {
         cfg.shaper = Shaper::NS9;               // 手动指定 NS9（越过了自动判定）
         Pipeline pl(cfg);
         PipelineStats st;
-        auto o = pl.process(a, &st);
+        auto o = complete(pl, a, &st);
         char buf[160];
         std::snprintf(buf, sizeof(buf), "(%d bit 输出, %zu 帧)", st.outBits, st.outFrames);
         check(st.outBits == 16 && st.outFrames == 44100 * 4, "16-bit / 176.4k 输出", buf);

@@ -43,7 +43,8 @@ static void ck(bool cond, const char* what, const std::string& detail = "") {
     }
 }
 
-int main() {
+int main(int argc, char** argv) {
+    const bool offline = argc == 2 && std::string(argv[1]) == "--offline";
     SetConsoleOutputCP(CP_UTF8);
     std::printf("=================================================================\n");
     std::printf("== WASAPI 采集核心离线门禁测试 (ROADMAP P4a)                   ==\n");
@@ -377,7 +378,8 @@ int main() {
 
     // ---------------- §7 真实设备回环采集 smoke（只读，铁律 1 约束） ----------------
     std::printf("\n-- §7 真实设备回环采集 smoke (只读回环监听，铁律 1 约束) --\n");
-    {
+    if (offline) std::printf("  [NOTE] --offline: real loopback device test not requested; synthetic tests still run\n");
+    else {
         auto devs = WasapiCapture::enumerate_capture(true);
         std::string lbDevName, lbDevId;
         for (const auto& d : devs) {

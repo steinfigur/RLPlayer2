@@ -9,8 +9,8 @@
 //       bext 的 origination_date（含"bext 在前才生效"与"空日期不占位"）、块内重复键的两条反向规则、
 //       APIC 封面与描述补缺（描述压过 TIT2/INAM）、数字流派是否真的入库、块内不是 ID3v2、ID3v2.4 ——
 //       除了断言字段值，每组还走一遍 [2] 的 A/B。
-//   [2] A/B（唯一能证明「开关变量不影响入库结果」的判据）：build/testdata 与 MUSIC 里各取真实文件
-//       （FLAC/WAV/MP3/OGG 各 5 个），用 lib_probe_one 在 RLPLAYER_NATIVE_TAGS=1/0 下逐字段比对
+//   [2] A/B（唯一能证明「开关变量不影响入库结果」的判据）：FFmpeg 在独立临时目录实际编码
+//       带已知标签的 FLAC/WAV/MP3/OGG 各 5 个，用 lib_probe_one 在 RLPLAYER_NATIVE_TAGS=1/0 下逐字段比对
 //       （title/artist/album/albumArtist/genre/year/trackNo/discNo/sr/bits/ch/hasCover + 时长 ±1 帧）。
 //       实现抽成 abOne()，[1] 的夹具与 [5] 的全量扫描用的是**同一条判据**。
 //   [3] 吞吐：N 个「1 秒静音 FLAC」的**首次全量扫描**（Library::startScan(true)，与 /api/lib/scan 同一入口）
@@ -43,7 +43,7 @@
 //   1) WAV 的 iXML/axml 仍**主动回退** ffprobe：XML 字段到 ffprobe 键的映射没实测过，
 //      本库 71 个 WAV 里 0 个样本。同理 "id3 " 块里的 ID3v2.2/unsynchronisation/帧标志位，
 //      以及 bext 长度 < 337（ffmpeg 会整份拒绝）——这些继续回退，宁可慢一次。
-//   2) MUSIC 不存在时 [2]/[5] 只用 build/testdata 的文件并如实打印「真实文件数不足」，不假装覆盖。
+//   2) [2] 独立构造 20 个实际编码容器，不依赖私人 MUSIC；[5]/[7]/[8] 没有私人库时明确未覆盖。
 //   3) [5] 的全库扫描要起 655 次 ffprobe（一遍），ctest 里约多花 15~20 s；这是"索引逐字节"这条
 //      判据的成本，不能靠抽查代替。
 #define WIN32_LEAN_AND_MEAN
@@ -1130,16 +1130,53 @@ static void unitTests(const fs::path& dir) {
     }
 }
 
+// Full codec outputs (including valid Ogg CRC/audio frames) are independent of the
+// metadata-only byte fixtures. Encoding uses files only; no audio endpoint is opened.
+struct EncodedSample { std::string title; int sampleRate = 0, channels = 0, track = 0; };
+static std::map<std::string, EncodedSample> g_encodedSamples;
+static bool encodeTaggedSamples(const fs::path& dir) {
+    const std::string ffmpeg = rta::audio::find_tool("ffmpeg");
+    ck(!ffmpeg.empty(), "ffmpeg 可用（独立编码 A/B 夹具）", ffmpeg);
+    if (ffmpeg.empty()) return false;
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    if (ec) { ck(false, "创建编码夹具目录", ec.message()); return false; }
+    for (const char* ext : {"flac", "wav", "mp3", "ogg"}) {
+        for (int i = 0; i < 5; ++i) {
+            const std::string stem = std::string(ext) + "_" + std::to_string(i);
+            const fs::path file = dir / (stem + "." + ext);
+            const int sr = (i % 2) ? 48000 : 44100, channels = (i % 3) ? 2 : 1;
+            const std::string title = "Encoded " + stem;
+            std::string codec;
+            if (std::string(ext) == "flac") codec = std::string("-c:a flac -sample_fmt ") + ((i % 2) ? "s32" : "s16");
+            else if (std::string(ext) == "wav") codec = std::string("-c:a ") + ((i % 2) ? "pcm_s24le" : "pcm_s16le");
+            else if (std::string(ext) == "mp3") codec = "-c:a libmp3lame -b:a 128k -id3v2_version " + std::to_string((i % 2) ? 4 : 3);
+            else codec = "-c:a libvorbis -q:a 4";
+            const std::string command = "\"" + ffmpeg + "\" -nostdin -hide_banner -loglevel error -f lavfi -i \"anullsrc=r=" +
+                std::to_string(sr) + ":cl=" + (channels == 1 ? "mono" : "stereo") + "\" -t 1 " + codec +
+                " -metadata \"title=" + title + "\" -metadata \"artist=Fixture Artist\" -metadata \"album=Fixture Album\"" +
+                " -metadata genre=Classical -metadata date=2024 -metadata track=" + std::to_string(i + 1) + " -y \"" + U8(file) + "\"";
+            std::string error;
+            const int rc = rta::audio::run_hidden(W(command), &error);
+            const bool made = rc == 0 && fs::is_regular_file(file, ec) && fs::file_size(file, ec) > 0 && !ec;
+            ck(made, "FFmpeg 实际编码 " + stem, "exit=" + std::to_string(rc) + " " + error);
+            if (!made) return false;
+            g_encodedSamples[U8(file)] = {title, sr, channels, i + 1};
+        }
+    }
+    return true;
+}
+
 // ===========================================================================
 // [2] A/B：真实文件逐字段比对
 // ===========================================================================
-static int abReal(const fs::path& root) {
-    std::printf("\n== [2] A/B：真实文件逐字段比对（native vs ffprobe） ==\n");
+static int abReal(const fs::path& root, const fs::path& encodedFixtures) {
+    std::printf("\n== [2] A/B：FFmpeg 独立编码容器逐字段比对（native vs ffprobe） ==\n");
     struct Pick { const char* ext; std::vector<std::string> files; };
     std::vector<Pick> picks;
     for (const char* e : { ".flac", ".wav", ".mp3", ".ogg" }) picks.push_back({ e, {} });
-    // MUSIC 优先（真实用户文件），再用 build/testdata / uploads / lyrtest 补齐到 5 个
-    const fs::path dirs[] = { root / "MUSIC", root / "build" / "testdata",
+    // The reproducible 20-file matrix is mandatory; historical/private sources remain optional.
+    const fs::path dirs[] = { encodedFixtures, root / "MUSIC", root / "build" / "testdata",
                               root / "build" / "uploads", root / "build" / "lyrtest" };
     for (auto& d : dirs) {
         for (auto& pk : picks) {
@@ -1152,9 +1189,17 @@ static int abReal(const fs::path& root) {
     int diffs = 0, compared = 0;
     for (auto& pk : picks) {
         std::printf("  -- %s：%zu 个文件 --\n", pk.ext, pk.files.size());
-        if (pk.files.empty()) { ck(false, std::string("有 ") + pk.ext + " 真实文件可比对"); continue; }
+        ck(pk.files.size() >= 5, std::string("A/B 每格式至少 5 个有效容器 ") + pk.ext, std::to_string(pk.files.size()));
         for (auto& f : pk.files) {
             const AbResult r = abOne(f);
+            const auto expected = g_encodedSamples.find(f);
+            if (expected != g_encodedSamples.end()) {
+                const auto& sample = expected->second;
+                ck(r.hit, "编码夹具原生通道实际命中", f + " " + r.why);
+                ck(r.ff.title == sample.title && r.ff.artist == "Fixture Artist" && r.ff.album == "Fixture Album" &&
+                   r.ff.year == 2024 && r.ff.trackNo == sample.track && r.ff.sampleRate == sample.sampleRate && r.ff.channels == sample.channels,
+                   "编码夹具 ffprobe 读出已知标签和音频参数", f);
+            }
             ++compared;
             std::string base = U8(fs::path(W(f)).filename());
             std::printf("     %s %-28s dur=%.3f->%.3f cover=%d/%d %s\n",
@@ -2077,7 +2122,9 @@ int main(int argc, char** argv) {
     ck(!ffprobe.empty(), "ffprobe 可用（回退路径的前提）", ffprobe);
 
     unitTests(tmp);
-    const int compared = abReal(root);
+    const fs::path encoded = tmp / "encoded";
+    if (!encodeTaggedSamples(encoded)) return 1;
+    const int compared = abReal(root, encoded);
     std::printf("\n[INFO] A/B 比对文件数 = %d\n", compared);
     wavSpecial(root);
     tagGuessFixtures(tmp / "qmark");

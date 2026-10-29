@@ -49,12 +49,12 @@ static std::string mock_handler(const HttpRequest& rq, std::string& ct) {
         return "{\"subsonic-response\":{\"status\":\"ok\",\"directory\":{\"id\":\"1\",\"child\":["
                "{\"id\":\"s1\",\"title\":\"第一首\",\"artist\":\"测试艺术家\",\"album\":\"测试专辑\","
                "\"suffix\":\"flac\",\"duration\":215,\"size\":34567890,\"isDir\":false,\"coverArt\":\"al-1\"},"
-               "{\"id\":\"d2\",\"title\":\"子目录\",\"isDir\":true}]}}";
+               "{\"id\":\"d2\",\"title\":\"子目录\",\"isDir\":true}]}}}";
     }
     if (rq.path.rfind("/rest/search3.view", 0) == 0) {
         if (!authOk) return "{\"subsonic-response\":{\"status\":\"failed\"}}";
         return "{\"subsonic-response\":{\"status\":\"ok\",\"searchResult3\":{\"song\":["
-               "{\"id\":\"s9\",\"title\":\"搜到的歌\",\"artist\":\"A\",\"album\":\"B\"}]}}";
+               "{\"id\":\"s9\",\"title\":\"搜到的歌\",\"artist\":\"A\",\"album\":\"B\"}]}}}";
     }
     if (rq.path.rfind("/rest/download.view", 0) == 0) {
         if (!authOk) { ct = "text/plain"; return "AUTH_FAIL"; }

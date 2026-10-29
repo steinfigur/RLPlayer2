@@ -128,7 +128,7 @@ int wmain(int argc, wchar_t** argv) {
         store = std::make_unique<HealthStore>(cachePath);
         if (!store->loadError().empty()) {
             // 如实报错且本次不回写（save() 会拒绝）；提示人工处理，绝不静默清空用户缓存
-            printf("!! 缓存文件损坏，本次忽略缓存且不会回写: %s\n   %s\n   （请删除或修复该文件后重试）\n\n",
+            fprintf(stderr, "!! 缓存文件损坏，本次忽略缓存且不会回写: %s\n   %s\n   （请删除或修复该文件后重试）\n\n",
                    cachePath.c_str(), store->loadError().c_str());
         }
     }
@@ -221,16 +221,19 @@ int wmain(int argc, wchar_t** argv) {
                (int)jobs.size(), nAnalyzed, nCached, nErr, avgMs, totalSec);
     }
 
+    bool cacheError = false;
     if (store) {
         if (store->loadError().empty()) {
             const bool ok = store->save();
-            printf("缓存: %s（%zu 条，本次新写 %d 条，%s）\n", cachePath.c_str(),
+            cacheError = !ok;
+            if (!jsonOut) printf("缓存: %s（%zu 条，本次新写 %d 条，%s）\n", cachePath.c_str(),
                    store->size(), nUp, ok ? "已保存" : "保存失败");
             if (jsonOut) fprintf(stderr, "cache=%s entries=%zu saved=%s\n",
                                  cachePath.c_str(), store->size(), ok ? "true" : "false");
         } else {
-            printf("缓存: 未写盘（加载时已报错，见上）\n");
+            cacheError = true;
+            fprintf(stderr, "缓存: 未写盘（加载时已报错，见上）\n");
         }
     }
-    return nErr > 0 ? 1 : 0;
+    return nErr > 0 || cacheError ? 1 : 0;
 }

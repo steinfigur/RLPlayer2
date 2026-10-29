@@ -36,7 +36,10 @@
 #include <cctype>
 #include <cstdio>
 #include <cmath>
+#include <bit>
+#include <algorithm>
 #include "pcm_dump.h"
+#include "pcm_gain.h"
 
 namespace rta::audio {
 
@@ -178,14 +181,14 @@ inline AsioDsdLevel asio_dsd_level_planes(const std::vector<const uint8_t*>& pla
     for (const uint8_t* p : planes) {
         if (!p || bytesPerPlane == 0) continue;
         unsigned long long ones = 0;
-        for (size_t i = 0; i < bytesPerPlane; ++i) ones += (unsigned)__builtin_popcount(p[i]);
+        for (size_t i = 0; i < bytesPerPlane; ++i) ones += (unsigned)std::popcount(p[i]);
         if (ones) r.allZero = false;
         const double mean = (double)ones / (8.0 * (double)bytesPerPlane);
         const double thisDc = std::fabs(2.0 * (mean - 0.5));
         if (thisDc > dc) dc = thisDc;
         for (size_t i = 0; i + W <= bytesPerPlane; i += W) {
             unsigned long long o = 0;
-            for (size_t k = 0; k < W; ++k) o += (unsigned)__builtin_popcount(p[i + k]);
+            for (size_t k = 0; k < W; ++k) o += (unsigned)std::popcount(p[i + k]);
             const double d = (double)o / (double)(W * 8);
             const double dev = std::fabs(2.0 * (d - mean));
             if (dev > peak) peak = dev;
@@ -731,8 +734,17 @@ public:
             if (dsdMode_) restore_pcm_format();
             free_drv();
         }
-        dsdMode_ = false;
+        dsdMode_ = false; dopMode_ = false; dopRendered_ = 0; liveGain_.store(1.0);
         if (g_inst == this) g_inst = nullptr;
+    }
+    // DoP uses an integer PCM carrier but its bytes are never PCM-scaled.
+    void set_dop_mode(bool enabled) {
+        if (dopMode_ != enabled) { dopRendered_ = 0; liveGain_.store(1.0); }
+        dopMode_ = enabled;
+    }
+    void set_live_gain_db(double db) {
+        if (dsdMode_ || dopMode_) return;
+        liveGain_.store(db <= -144.0 ? 0.0 : (db == 0.0 ? 1.0 : std::pow(10.0, db / 20.0)));
     }
     // 推交错 int32；返回实际接收帧数
     size_t push(const int32_t* pcm, size_t frames) {
@@ -780,6 +792,7 @@ public:
     long pref_buf() const { return prefBuf_; }
 
 private:
+    friend struct AsioOfflineTestAccess;
     // DSD 打包方式（由驱动 getChannelInfo 报的类型决定，不是我们挑的）
     enum class DsdPack { Msb1, Lsb1 };
 
@@ -849,8 +862,8 @@ private:
             ringCount_ -= take;
             if (take < period) {
                 ++underruns_;
-                std::memset(tmp.data() + take * (size_t)ch_, 0,
-                            (period - take) * (size_t)ch_ * sizeof(int32_t));
+                const int32_t silence = dsdMode_ ? 0x69 : (dopMode_ ? 0x6969 : 0);
+                std::fill(tmp.begin() + take * (size_t)ch_, tmp.end(), silence);
             }
         }
         if (dsdMode_) {
@@ -872,6 +885,16 @@ private:
             }
             return;
         }
+        if (dopMode_) {
+            for (size_t n = 0; n < period; ++n) for (int c = 0; c < ch_; ++c) {
+                uint32_t v = (uint32_t)tmp[n * (size_t)ch_ + (size_t)c] & 0xFFFFu;
+                v |= (((dopRendered_ + n) & 1u) ? 0xFAu : 0x05u) << 16;
+                if (v & 0x800000u) v |= 0xFF000000u;
+                tmp[n * (size_t)ch_ + (size_t)c] = (int32_t)v;
+            }
+            dopRendered_ += period;
+        }
+        if (!dopMode_) apply_pcm_live_gain(tmp.data(), tmp.size(), srcBits_, liveGain_.load());
         for (int c = 0; c < ch_; ++c) {
             void* dst = bufs_[(size_t)c].buffers[idx];
             if (!dst) continue;
@@ -892,7 +915,7 @@ private:
                 int32_t* d = (int32_t*)dst;
                 for (size_t i = 0; i < n; ++i) {
                     const double v = (double)src[i * stride] * inv;
-                    d[i] = (int32_t)llround(v * 2147483647.0);
+                    d[i] = (int32_t)std::clamp(std::round(v * 2147483648.0), -2147483648.0, 2147483647.0);
                 }
                 break;
             }
@@ -901,7 +924,7 @@ private:
                 for (size_t i = 0; i < n; ++i) {
                     const double v = (double)src[i * stride] * inv;
                     // 24-bit 满幅：DoP 的标记位在最低 8 位，round-trip 必须精确
-                    const int32_t q = (int32_t)llround(v * 8388607.0);
+                    const int32_t q = (int32_t)std::clamp(std::round(v * 8388608.0), -8388608.0, 8388607.0);
                     const uint32_t u = (uint32_t)q;
                     d[i * 3 + 0] = (unsigned char)(u & 0xFF);
                     d[i * 3 + 1] = (unsigned char)((u >> 8) & 0xFF);
@@ -913,7 +936,7 @@ private:
                 int16_t* d = (int16_t*)dst;
                 for (size_t i = 0; i < n; ++i) {
                     const double v = (double)src[i * stride] * inv;
-                    d[i] = (int16_t)llround(v * 32767.0);
+                    d[i] = (int16_t)std::clamp(std::round(v * 32768.0), -32768.0, 32767.0);
                 }
                 break;
             }
@@ -936,6 +959,9 @@ private:
     ASIOSampleRate dsdRate_ = 0.0;
     int wantCh_ = 2, ch_ = 2, srcBits_ = 24;
     bool dsdMode_ = false;
+    bool dopMode_ = false;
+    uint64_t dopRendered_ = 0;
+    std::atomic<double> liveGain_{1.0};
     long dsdBufBytes_ = 0;   // DSD 每次回调的字节数 = 驱动 bufferSize/8
     DsdPack packing_ = DsdPack::Msb1;
     AsioDsdInfo dsd_{};

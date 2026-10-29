@@ -263,19 +263,54 @@ inline bool is_disambiguation_page(const std::string& title, const std::string& 
 // 缓存序列化、反序列化、合并与路径
 // ---------------------------------------------------------------------------
 
-inline fsx::path knowledge_cache_path(const std::string& baseDir, const std::string& entity_id) {
+// Language tags are path components and remote query inputs: no separators, encoding or drive syntax.
+inline bool knowledge_language_valid(const std::string& lang) {
+    if (lang.empty()) return true; // Existing empty-language requests mean zh.
+    if (lang.size() > 63) return false;
+    size_t segment = 0; bool first = true;
+    for (unsigned char c : lang) {
+        if (c == '-') {
+            if (segment == 0 || segment > 8) return false;
+            first = false; segment = 0; continue;
+        }
+        const bool alpha = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+        if (!alpha && (first || c < '0' || c > '9')) return false;
+        ++segment;
+    }
+    return segment > 0 && segment <= 8;
+}
+inline fsx::path knowledge_entity_path(const std::string& baseDir, const std::string& id,
+                                      const std::string& filename) {
+    if (id.empty() || id == "." || id == "..") return {};
+    for (unsigned char c : id)
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || c == '-' || c == '_')) return {};
+    std::error_code ec;
     const std::string b = baseDir.empty() ? EntityStore::instance().baseDir() : baseDir;
-    return meta_path_of(b) / "entities" / entity_id / "knowledge.json";
+    const fsx::path base = fsx::weakly_canonical(meta_path_of(b), ec);
+    if (ec) return {};
+    const fsx::path root = base / "entities";
+    const fsx::path target = fsx::weakly_canonical(root / id / filename, ec);
+    if (ec) return {};
+    auto r = root.begin(), t = target.begin();
+    for (; r != root.end(); ++r, ++t) if (t == target.end() || *r != *t) return {};
+    return target;
+}
+inline fsx::path knowledge_cache_path(const std::string& baseDir, const std::string& entity_id,
+                                      const std::string& lang = "zh") {
+    if (!knowledge_language_valid(lang)) return {};
+    return knowledge_entity_path(baseDir, entity_id, "knowledge-" + (lang.empty() ? "zh" : lang) + ".json");
 }
 
 inline std::string knowledge_to_json(const std::vector<KnowledgeMaterial>& materials,
                                      const std::string& entity_id,
-                                     const std::string& subject) {
+                                     const std::string& subject, const std::string& lang = "zh") {
     std::ostringstream o;
     const long long now_sec = (long long)std::time(nullptr);
     o << "{\n"
       << "  \"entity_id\": \"" << meta_jesc(entity_id) << "\",\n"
       << "  \"subject\": \"" << meta_jesc(subject) << "\",\n"
+      << "  \"language\": \"" << meta_jesc(lang.empty() ? "zh" : lang) << "\",\n"
       << "  \"updated_at\": " << now_sec << ",\n"
       << "  \"materials\": [\n";
     for (size_t i = 0; i < materials.size(); ++i) {
@@ -371,26 +406,46 @@ inline bool knowledge_has_unexpired(const std::vector<KnowledgeMaterial>& materi
 inline bool knowledge_save_cache(const std::string& baseDir,
                                  const std::string& entity_id,
                                  const std::string& subject,
-                                 const std::vector<KnowledgeMaterial>& materials) {
-    if (entity_id.empty()) return false;
-    const fsx::path p = knowledge_cache_path(baseDir, entity_id);
-    const std::string content = knowledge_to_json(materials, entity_id, subject);
+                                 const std::vector<KnowledgeMaterial>& materials,
+                                 const std::string& lang = "zh") {
+    const fsx::path p = knowledge_cache_path(baseDir, entity_id, lang);
+    if (p.empty()) return false;
+    const std::string content = knowledge_to_json(materials, entity_id, subject, lang);
     return entity_write_atomic(p, content);
 }
 
 inline bool knowledge_load_cache(const std::string& baseDir,
                                  const std::string& entity_id,
                                  std::vector<KnowledgeMaterial>& materials_out,
-                                 std::string* err_out = nullptr) {
-    if (entity_id.empty()) return false;
-    const fsx::path p = knowledge_cache_path(baseDir, entity_id);
+                                 std::string* err_out = nullptr,
+                                 const std::string& lang = "zh") {
+    const fsx::path p = knowledge_cache_path(baseDir, entity_id, lang);
+    if (p.empty()) { if (err_out) *err_out = "invalid cache identity"; return false; }
     std::string text;
     if (!entity_read_file(p, text)) {
-        if (err_out) *err_out = "cache file not found or empty";
-        return false;
+        const auto legacy = knowledge_entity_path(baseDir, entity_id, "knowledge.json");
+        if (legacy.empty() || !entity_read_file(legacy, text)) {
+            if (err_out) *err_out = "cache file not found or empty";
+            return false;
+        }
     }
     std::string id_out, sub_out;
-    return knowledge_from_json(text, materials_out, id_out, sub_out, err_out);
+    std::vector<KnowledgeMaterial> materials;
+    if (!knowledge_from_json(text, materials, id_out, sub_out, err_out)) return false;
+    const auto json = rta::net::json_parse(text);
+    const std::string requested = lang.empty() ? "zh" : lang;
+    if (id_out != entity_id || (json.has("language") && json["language"].s() != requested)) {
+        if (err_out) *err_out = "cache identity mismatch";
+        return false;
+    }
+    if (!json.has("language")) {
+        // Legacy files have no request identity: reuse only explicitly matching materials.
+        materials.erase(std::remove_if(materials.begin(), materials.end(), [&](const auto& m) {
+            return m.lang != requested;
+        }), materials.end());
+    }
+    materials_out = std::move(materials);
+    return !materials_out.empty();
 }
 
 // ---------------------------------------------------------------------------
@@ -401,37 +456,40 @@ inline bool knowledge_load_cache(const std::string& baseDir,
 // 这里落一个 knowledge.miss.json 标记，默认 6 小时内直接返回"近期未找到"，不再联网；成功后清除。
 // ---------------------------------------------------------------------------
 
-inline fsx::path knowledge_miss_path(const std::string& baseDir, const std::string& entity_id) {
-    const std::string b = baseDir.empty() ? EntityStore::instance().baseDir() : baseDir;
-    return meta_path_of(b) / "entities" / entity_id / "knowledge.miss.json";
+inline fsx::path knowledge_miss_path(const std::string& baseDir, const std::string& entity_id, const std::string& lang = "zh") {
+    if (!knowledge_language_valid(lang)) return {};
+    return knowledge_entity_path(baseDir, entity_id, "knowledge-" + (lang.empty() ? "zh" : lang) + ".miss.json");
 }
 
 inline bool knowledge_recent_miss(const std::string& baseDir, const std::string& entity_id,
-                                  long long ttl_sec, long long* at_out = nullptr) {
-    if (entity_id.empty() || ttl_sec <= 0) return false;
+                                  long long ttl_sec, long long* at_out = nullptr, const std::string& lang = "zh") {
+    if (knowledge_miss_path(baseDir, entity_id, lang).empty() || ttl_sec <= 0) return false;
     std::string text;
-    if (!entity_read_file(knowledge_miss_path(baseDir, entity_id), text)) return false;
+    if (!entity_read_file(knowledge_miss_path(baseDir, entity_id, lang), text)) return false;
     const rta::net::Json j = rta::net::json_parse(text);
     if (j.type != rta::net::Json::Obj) return false;
-    const long long at = (long long)j["at"].n();
-    if (at <= 0) return false;
+    if (j["at"].type != rta::net::Json::Num || j["at"].num <= 0 ||
+        j["at"].num > (double)std::time(nullptr) || std::floor(j["at"].num) != j["at"].num ||
+        j["entity_id"].s() != entity_id || j["language"].s() != (lang.empty() ? "zh" : lang)) return false;
+    const long long at = static_cast<long long>(j["at"].num);
     if (at_out) *at_out = at;
     return ((long long)std::time(nullptr) - at) < ttl_sec;
 }
 
 inline void knowledge_mark_miss(const std::string& baseDir, const std::string& entity_id,
-                                const std::string& subject, const std::string& error) {
-    if (entity_id.empty()) return;
+                                const std::string& subject, const std::string& error, const std::string& lang = "zh") {
+    if (knowledge_miss_path(baseDir, entity_id, lang).empty()) return;
     std::ostringstream o;
     o << "{\"entity_id\":\"" << meta_jesc(entity_id) << "\",\"subject\":\"" << meta_jesc(subject)
+      << "\",\"language\":\"" << meta_jesc(lang.empty() ? "zh" : lang)
       << "\",\"at\":" << (long long)std::time(nullptr) << ",\"error\":\"" << meta_jesc(error) << "\"}\n";
-    entity_write_atomic(knowledge_miss_path(baseDir, entity_id), o.str());
+    entity_write_atomic(knowledge_miss_path(baseDir, entity_id, lang), o.str());
 }
 
-inline void knowledge_clear_miss(const std::string& baseDir, const std::string& entity_id) {
-    if (entity_id.empty()) return;
+inline void knowledge_clear_miss(const std::string& baseDir, const std::string& entity_id, const std::string& lang = "zh") {
+    if (knowledge_miss_path(baseDir, entity_id, lang).empty()) return;
     std::error_code ec;
-    fsx::remove(knowledge_miss_path(baseDir, entity_id), ec);
+    fsx::remove(knowledge_miss_path(baseDir, entity_id, lang), ec);
 }
 
 // ---------------------------------------------------------------------------
@@ -813,18 +871,12 @@ inline KnowledgeResult knowledge_get(const std::string& entity_id,
     const std::string baseDir = !opts.metabase.empty()
                                     ? opts.metabase
                                     : EntityStore::instance().baseDir();
-    const fsx::path cache_path = knowledge_cache_path(baseDir, entity_id);
-
-    std::vector<KnowledgeMaterial> cached_materials;
-    std::string cache_id, cache_sub, cache_err;
-    std::string cache_bytes;
-    const bool cache_file_exists = entity_read_file(cache_path, cache_bytes);
-    bool cache_valid = false;
-    if (cache_file_exists) {
-        if (knowledge_from_json(cache_bytes, cached_materials, cache_id, cache_sub, &cache_err)) {
-            cache_valid = true;
-        }
+    if (!knowledge_language_valid(opts.lang) || knowledge_cache_path(baseDir, entity_id, opts.lang).empty()) {
+        res.error = "invalid knowledge cache identity or language"; return res;
     }
+    std::vector<KnowledgeMaterial> cached_materials;
+    std::string cache_err;
+    const bool cache_valid = knowledge_load_cache(baseDir, entity_id, cached_materials, &cache_err, opts.lang);
 
     const long long now_sec = (long long)std::time(nullptr);
     const bool has_unexpired = cache_valid && knowledge_has_unexpired(cached_materials, now_sec);
@@ -832,7 +884,7 @@ inline KnowledgeResult knowledge_get(const std::string& entity_id,
     // 0) 失败负缓存（6 小时）：上一次已经确认「没有权威材料」→ 直接返回，不再联网
     //    （用户 261023-04 #14：每次打开艺术家页都重打维基，既慢又什么都出不来）
     long long miss_at = 0;
-    if (!opts.refresh && knowledge_recent_miss(baseDir, entity_id, 6 * 3600, &miss_at)) {
+    if (!opts.refresh && knowledge_recent_miss(baseDir, entity_id, 6 * 3600, &miss_at, opts.lang)) {
         res.from_cache = true;
         res.offline = false;
         res.error = "近期未找到权威材料（6 小时内不再重试；可在资料页点「刷新资料」强制重试）";
@@ -841,7 +893,7 @@ inline KnowledgeResult knowledge_get(const std::string& entity_id,
 
     // 1) 命中未过期缓存且未要求 refresh -> 直接返回缓存
     if (!opts.refresh && has_unexpired) {
-        knowledge_clear_miss(baseDir, entity_id);
+        knowledge_clear_miss(baseDir, entity_id, opts.lang);
         res.materials = cached_materials;
         res.from_cache = true;
         res.offline = false;
@@ -875,10 +927,10 @@ inline KnowledgeResult knowledge_get(const std::string& entity_id,
 
     // 3) 处理网络拉取成功结果
     if (!fresh_materials.empty()) {
-        knowledge_clear_miss(baseDir, entity_id);
+        knowledge_clear_miss(baseDir, entity_id, opts.lang);
         std::vector<KnowledgeMaterial> merged = cached_materials;
         knowledge_merge_materials(merged, fresh_materials);
-        knowledge_save_cache(baseDir, entity_id, subject, merged);
+        knowledge_save_cache(baseDir, entity_id, subject, merged, opts.lang);
 
         res.materials = std::move(merged);
         res.from_cache = false;
@@ -913,7 +965,7 @@ inline KnowledgeResult knowledge_get(const std::string& entity_id,
         res.error = "未找到任何相关权威材料";
     }
     // 落失败标记：下一次（6 小时内）不再联网重试
-    if (!opts.refresh) knowledge_mark_miss(baseDir, entity_id, subject, res.error);
+    if (!opts.refresh) knowledge_mark_miss(baseDir, entity_id, subject, res.error, opts.lang);
     return res;
 }
 

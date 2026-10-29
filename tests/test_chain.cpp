@@ -14,6 +14,15 @@ using rta::audio::AudioBuffer;
 namespace dsp = rta::dsp;
 using dsp::kPi;
 
+// A finite source ends only after the pipeline has emitted its delayed content.
+static AudioBuffer complete(Pipeline& pl, const AudioBuffer& in, PipelineStats* st) {
+    auto out = pl.process(in, st);
+    auto tail = pl.finish();
+    out.raw.insert(out.raw.end(), tail.raw.begin(), tail.raw.end());
+    if (st) st->outFrames = out.frames();
+    return out;
+}
+
 static int fails = 0;
 static void check(bool ok, const std::string& what, const std::string& detail = "") {
     printf("  [%s] %s %s\n", ok ? "PASS" : "FAIL", what.c_str(), detail.c_str());
@@ -51,7 +60,7 @@ int main() {
         PipelineConfig cfg;
         Pipeline pl(cfg);
         PipelineStats st;
-        auto o = pl.process(a, &st);
+        auto o = complete(pl, a, &st);
         bool same = st.bitPerfect && o.raw.size() == a.raw.size();
         if (same) for (size_t i = 0; i < a.raw.size(); ++i) if (a.raw[i] != o.raw[i]) { same = false; break; }
         check(same, "全旁路逐位相同");
@@ -70,7 +79,7 @@ int main() {
         cfg.channel[1].eq.push_back(q);
         Pipeline pl(cfg);
         PipelineStats st;
-        auto o = pl.process(a, &st);
+        auto o = complete(pl, a, &st);
         const double got = peak_after(o, 5000);
         const double gainDb = 20.0 * std::log10(got / base);
         char buf[200];
@@ -87,7 +96,7 @@ int main() {
         cfg.matrix = { {0, 0, 1.0}, {1, 0, 1.0}, {0, 1, 1.0}, {1, 1, 1.0} };   // 双声道都变成 L+R
         Pipeline pl(cfg);
         PipelineStats st;
-        auto o = pl.process(a, &st);
+        auto o = complete(pl, a, &st);
         // 输入 R 是 L 的一半，故 L+R = 1.5 * L
         const double l = o.sample(5000, 0), r = o.sample(5000, 1);
         char buf[200];
@@ -106,14 +115,14 @@ int main() {
         cfg.channel[1].ir = {0.5};
         Pipeline pl(cfg);
         PipelineStats st;
-        auto o = pl.process(a, &st);
+        auto o = complete(pl, a, &st);
         // 逐样本比：输出应为输入的一半。
         // 判据取"≤1 LSB"而不是逐位相等：IR=0.5 时 raw*0.5 恰好落在 .5 取整边界上，
         // FFT 往返的 1e-16 相对噪声会决定进位方向，导致约四分之一样本差 1 LSB。
         // 这是浮点卷积路径的固有属性，不是缺陷——用逐位相等去判会得到假失败。
-        // ★ 流式卷积器有 convBlock 帧的算法延迟（Round 34），比对时必须计入
+        // Pipeline removes the convolution FIFO delay; compare on the source timeline.
         const double lsb = 1.0 / 8388608.0;
-        const size_t lat = cfg.convBlock;
+        const size_t lat = 0;
         double maxDiff = 0.0; size_t over1lsb = 0; const size_t skip = 100;
         for (size_t n = skip + lat; n + 1 < N; ++n) {
             const double d = std::fabs(o.sample(n, 0) - a.sample(n - lat, 0) * 0.5);
@@ -139,11 +148,10 @@ int main() {
         cfg.channel[1].useGpu = true;
         Pipeline pl(cfg);
         PipelineStats st;
-        auto o = pl.process(a, &st);
+        auto o = complete(pl, a, &st);
         const double lsb = 1.0 / 8388608.0;
-        // GPU 走整块卷积（无 FIFO 延迟）；CPU 走流式卷积器（有 convBlock 延迟）。
-        // 延迟必须按【实际走的路径】取，不能一刀切。
-        const size_t lat2 = st.usedGpuConvolution ? 0 : cfg.convBlock;
+        // Both implementations share source-aligned Pipeline output.
+        const size_t lat2 = 0;
         double maxDiff = 0.0; size_t over = 0;
         for (size_t n = 100 + lat2; n + 1 < N; ++n) {
             const double d = std::fabs(o.sample(n, 0) - a.sample(n - lat2, 0) * 0.5);
@@ -168,7 +176,7 @@ int main() {
         cfg.volumeRampMs = 0.0;
         Pipeline pl(cfg);
         PipelineStats st;
-        auto o = pl.process(a, &st);
+        auto o = complete(pl, a, &st);
         size_t bad = 0;
         for (size_t n = 100; n < N; ++n) {
             const double want = std::floor(a.sample(n, 0) * 0.5 * 8388608.0 + 0.5) / 8388608.0;
@@ -202,7 +210,7 @@ int main() {
         cfg.volumeDb = -3.0;
         Pipeline pl(cfg);
         PipelineStats st;
-        auto o = pl.process(a, &st);
+        auto o = complete(pl, a, &st);
         char buf[260];
         std::snprintf(buf, sizeof(buf),
                       "(阶段: matrix=%d eq=%d(%d 个) conv=%d(IR %d) resample=%d volume=%d; %zu -> %zu 帧 @%u Hz)",

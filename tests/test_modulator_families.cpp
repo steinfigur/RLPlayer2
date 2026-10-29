@@ -25,7 +25,11 @@ static void check(bool ok, const std::string& what, const std::string& detail = 
     if (!ok) ++fails;
 }
 
-// 频域相干功率分析
+// Coherent-tone power with a periodic Hann window. Tone coherence does not make
+// broadband shaped quantization noise periodic: a rectangular observation leaks
+// its large ultrasonic energy into the audio band through the record boundary.
+// sum(w^2) normalization preserves integrated power (Hann ENBW = 1.5 bins),
+// and the coherent fundamental occupies exactly kFund-1..kFund+1.
 struct Spec {
     double signalDb = 0.0;
     double inBandNoiseDb = 0.0;
@@ -36,9 +40,14 @@ struct Spec {
 static Spec analyse_spectrum(const std::vector<double>& y, double fs, double fin, double fBandTop = 20000.0) {
     const size_t N = y.size();
     std::vector<cplx> b(N);
-    for (size_t i = 0; i < N; ++i) b[i] = cplx(y[i], 0.0);
+    double windowPower = 0.0;
+    for (size_t i = 0; i < N; ++i) {
+        const double w = 0.5 - 0.5 * std::cos(2.0 * kPi * (double)i / (double)N);
+        b[i] = cplx(y[i] * w, 0.0);
+        windowPower += w * w;
+    }
     fft(b);
-    auto pwr = [&](size_t k) { return 2.0 * std::norm(b[k]) / ((double)N * (double)N); };
+    auto pwr = [&](size_t k) { return 2.0 * std::norm(b[k]) / ((double)N * windowPower); };
 
     const size_t kFund = (size_t)std::llround(fin / fs * (double)N);
     const size_t kTop  = (size_t)std::llround(fBandTop / fs * (double)N);
@@ -197,7 +206,7 @@ int main() {
 
         for (const auto& r : rates) {
             const double binHz = r.fs / (double)N;
-            const double fin = binHz * 23.0; // 相干频点（第 23 bin，无加窗泄漏）
+            const double fin = binHz * 23.0; // Coherent bin 23; Hann retains its complete three-bin main lobe.
 
             for (const auto& f : families) {
                 if (r.fs < 5.6e6 && f.order == 7 && f.levels == 2 && f.family == ModulatorFamily::Dsd) {
@@ -269,10 +278,10 @@ int main() {
                 const double smallBar = (f.levels > 2 && r.fs >= 22579200.0) ? 15.0 : 20.0;
                 check(std::isfinite(s60.snrDb) && s60.snrDb >= smallBar,
                       item + " -60 dBFS 小信号 SNR 达标 (>= " + std::to_string((int)smallBar) + " dB)");
-                // 2026-10-25（抖动注入点修复 + H∞ 受控综合后）EC 族门槛只升不降：
-                // 旧基线（抖动未整形泄漏）全部 1-bit 族卡在 ~86 dB；修复后实测
-                // EC-5@DSD64≈79~105 / EC-7@DSD256≈104~116 / EC-7@DSD512≈114+ dB，
-                // 门槛按最保守实测值 −5 dB 设置。
+                // Existing EC quality limits remain unchanged: 75 dB, or 105 dB for EC7/DSD512.
+                // Historical rectangular-window numbers included leakage from strong ultrasonic
+                // quantization noise. The Hann estimator is independently power/ENBW calibrated
+                // in test_audit_dsp_ec_numerics, including an in-band negative control.
                 if (f.family == ModulatorFamily::Ec && f.levels == 2) {
                     const double ecBar = (f.order == 7 && r.fs >= 22579200.0) ? 105.0 : 75.0;
                     check(std::isfinite(s6.snrDb) && s6.snrDb > ecBar,

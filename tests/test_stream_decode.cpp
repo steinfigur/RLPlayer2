@@ -104,8 +104,12 @@ static void test_wav_header_parser() {
         wr16(h, 22);         // cbSize
         wr16(h, 24);         // validBits
         wr32(h, 3);          // channelMask
-        wr16(h, 1);          // subFormat GUID data1 = 1 (PCM)
-        h.insert(h.end(), 14, 0); // rest of GUID
+        // KSDATAFORMAT_SUBTYPE_PCM = 00000001-0000-0010-8000-00aa00389b71
+        // Windows SDK ksmedia.h: DEFINE_WAVEFORMATEX_GUID(WAVE_FORMAT_PCM).
+        wr32(h, 1);          // GUID Data1 (PCM), little endian
+        wr16(h, 0);          // GUID Data2
+        wr16(h, 0x0010);     // GUID Data3
+        h.insert(h.end(), {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71});
         h.insert(h.end(), {'d','a','t','a'});
         wr32(h, 0xFFFFFFFF); // 流式管道未定长度
 

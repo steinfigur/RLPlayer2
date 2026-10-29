@@ -59,7 +59,7 @@
 #include "version.h"
 #include "net/http_client.h"
 #include "net/json.h"
-#include "net/update_check.h"     // 纯逻辑层（MAC 移植）
+#include "net/update_staging.h"   // 完整暂存契约，复用 update_check.h 的版本/SHA 语义
 #include "platform/http.h"        // onChunk + discardBody（边下边写盘）
 #include "platform/path.h"
 #include "platform/process.h"     // run_hidden（tar 解压）
@@ -133,7 +133,10 @@ inline bool write_text_file(const std::string& p, const std::string& text) {
     std::ofstream f(rta::platform::from_utf8(p), std::ios::binary | std::ios::trunc);
     if (!f) return false;
     f.write(text.data(), (std::streamsize)text.size());
-    return (bool)f;
+    f.flush();
+    if (!f) { f.close(); return false; }
+    f.close();
+    return !f.fail();
 }
 inline std::string lower_ascii(std::string s) {
     for (char& c : s) if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
@@ -258,12 +261,6 @@ inline bool url_allowed(const std::string& url) {
 // ---------------------------------------------------------------------------
 // 3. 清单扩展（files[] / full / files_base）——纯函数，可离线断言
 // ---------------------------------------------------------------------------
-struct ManifestFile {
-    std::string path;
-    std::string sha256;
-    long long size = 0;
-};
-
 struct ManifestExt {
     bool ok = false;
     std::string error;
@@ -278,27 +275,12 @@ struct ManifestExt {
     std::string publishedAt;
 };
 
-inline std::string norm_rel(std::string p) {
-    for (char& c : p) if (c == '/') c = '\\';
-    while (!p.empty() && (p.front() == '\\' || p.front() == '.')) p.erase(p.begin());
-    return p;
-}
-
-// 只有「相对、无穿越、非绝对盘符」的路径才允许进安装目录
-inline bool safe_install_rel(const std::string& p) {
-    if (p.empty() || p.size() > 512) return false;
-    if (p.find("..") != std::string::npos) return false;
-    if (p.find("://") != std::string::npos) return false;
-    if (p.size() >= 2 && p[1] == ':') return false;
-    if (p[0] == '\\' || p[0] == '/') return false;
-    return true;
-}
-
 inline ManifestExt parse_manifest_ext(const std::string& json) {
     ManifestExt m;
     const rta::net::Json j = rta::net::json_parse(json);
     if (j.type != rta::net::Json::Obj) { m.error = "清单不是 JSON 对象"; return m; }
     m.version = j["version"].s();
+    if (!parse_version(m.version).valid || m.version.find_first_of("/\\\r\n") != std::string::npos) { m.error = "清单 version 非法"; return m; }
     m.notes = j["notes"].s();
     m.publishedAt = j["published_at"].s();
     const std::string dl = j["download_url"].s();
@@ -319,6 +301,7 @@ inline ManifestExt parse_manifest_ext(const std::string& json) {
     const std::string fb = j["files_base"].s();
     if (!fb.empty() && url_allowed(fb)) m.filesBase = fb;
 
+    std::set<std::string> seen;
     const rta::net::Json& arr = j["files"];
     if (arr.type == rta::net::Json::Arr) {
         for (size_t i = 0; i < arr.size(); ++i) {
@@ -332,8 +315,10 @@ inline ManifestExt parse_manifest_ext(const std::string& json) {
             ManifestFile f;
             f.path = norm_rel(rawPath);
             f.sha256 = lower_ascii(e["sha256"].s());
-            f.size = (long long)e["size"].n();
-            if (!safe_install_rel(f.path) || !is_hex64(f.sha256)) {
+            const double declaredSize = e["size"].n();
+            if (e["size"].type != rta::net::Json::Num || !std::isfinite(declaredSize) || declaredSize < 0 || declaredSize > 9007199254740991.0 || declaredSize != std::floor(declaredSize)) { m.error = "清单文件 size 非法"; return m; }
+            f.size = (long long)declaredSize;
+            if (!safe_install_rel(f.path) || !is_hex64(f.sha256) || !seen.insert(lower_ascii(f.path)).second) {
                 m.error = "清单 files[] 第 " + std::to_string(i + 1) + " 条不合法（路径或 sha256）";
                 return m;
             }
@@ -343,6 +328,95 @@ inline ManifestExt parse_manifest_ext(const std::string& json) {
     if (m.files.empty()) { m.error = "清单缺少 files[]（增量更新需要逐文件 sha256）"; return m; }
     m.ok = true;
     return m;
+}
+
+inline std::recursive_mutex& update_artifacts_mutex() { static std::recursive_mutex mutex; return mutex; }
+// One writer per installation, including other launcher/rtaweb processes. The local
+// recursive lock gives each same-thread nested apply->rollback scope the same lease.
+class UpdateWriterLease {
+public:
+    explicit UpdateWriterLease(std::string& err)
+        : local_(update_artifacts_mutex(), std::try_to_lock) {
+        if (!local_.owns_lock()) { err = "更新文件正在使用，请稍后重试"; return; }
+        auto& held = current();
+        const std::string path = join_path(updates_root(), "writer.lock");
+        if (held.depth != 0) {
+            if (held.path != path) { err = "嵌套更新事务的安装目录不一致"; return; }
+        } else {
+            if (!ensure_dir(updates_root())) { err = "无法创建更新写锁目录"; return; }
+            held.path = path;
+            held.handle = ::CreateFileW(rta::platform::from_utf8(path).c_str(), GENERIC_READ | GENERIC_WRITE,
+                0, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (held.handle == INVALID_HANDLE_VALUE) {
+                const DWORD code = ::GetLastError(); held.path.clear();
+                err = (code == ERROR_SHARING_VIOLATION || code == ERROR_LOCK_VIOLATION)
+                    ? "另一进程正在使用更新文件，请稍后重试"
+                    : "无法获取更新写锁（Windows 错误 " + std::to_string(code) + "）";
+                return;
+            }
+        }
+        ++held.depth; owns_ = true;
+    }
+    ~UpdateWriterLease() {
+        if (!owns_) return;
+        auto& held = current();
+        if (--held.depth == 0) { ::CloseHandle(held.handle); held.handle = INVALID_HANDLE_VALUE; held.path.clear(); }
+    }
+    bool owns_lock() const { return owns_; }
+    UpdateWriterLease(const UpdateWriterLease&) = delete;
+    UpdateWriterLease& operator=(const UpdateWriterLease&) = delete;
+private:
+    struct Held { std::string path; HANDLE handle = INVALID_HANDLE_VALUE; unsigned depth = 0; };
+    static Held& current() { static thread_local Held held; return held; }
+    std::unique_lock<std::recursive_mutex> local_;
+    bool owns_ = false;
+};
+
+
+// The digest marker is written last and atomically: no directory enumeration can
+// turn an interrupted download into a completed update.
+inline std::string staging_manifest_path(const std::string& ver) { return join_path(version_dir(ver), "staging-manifest.json"); }
+inline std::string staging_complete_path(const std::string& ver) { return join_path(version_dir(ver), "staging-complete.sha256"); }
+inline bool write_update_atomic(const std::string& path, const std::string& text) {
+    const std::string tmp = path + ".tmp";
+    if (!write_text_file(tmp, text)) return false;
+    return ::MoveFileExW(rta::platform::from_utf8(tmp).c_str(), rta::platform::from_utf8(path).c_str(),
+        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+}
+inline bool verify_staging(const std::string& ver, const std::string& staging,
+    StagingManifest& m, std::string& err) {
+    if (!parse_version(ver).valid || ver.find_first_of("/\\\r\n") != std::string::npos ||
+        staging != join_path(version_dir(ver), "staging")) { err = "暂存路径与版本不匹配"; return false; }
+    const std::string text = read_text_file(staging_manifest_path(ver));
+    if (read_text_file(staging_complete_path(ver)) != sha256_hex(text)) {
+        err = "暂存未完成或清单摘要不符"; return false;
+    }
+    if (!parse_staging_manifest(text, m, err)) return false;
+    return validate_staging_manifest(m, ver, install_dir(), [&](const StagingFile& e) {
+        const std::string path = join_path(e.staged ? staging : install_dir(), e.file.path);
+        std::string hex, why;
+        return file_size(path) == e.file.size && sha256_file(path, hex, why) && hex_equals_ci(hex, e.file.sha256);
+    }, err);
+}
+inline bool complete_staging(const ManifestExt& man, const std::vector<std::string>& downloads,
+    const std::string& staging, std::string& err) {
+    StagingManifest m; m.version = man.version; m.installDir = install_dir();
+    std::set<std::string> staged;
+    for (const auto& p : downloads) staged.insert(lower_ascii(norm_rel(p)));
+    for (const auto& f : man.files) m.files.push_back({f, staged.count(lower_ascii(norm_rel(f.path))) != 0});
+    const std::string text = serialize_staging_manifest(m);
+    StagingManifest checked;
+    if (!parse_staging_manifest(text, checked, err) || !validate_staging_manifest(checked, man.version,
+        install_dir(), [&](const StagingFile& e) {
+            const std::string path = join_path(e.staged ? staging : install_dir(), e.file.path);
+            std::string hex, why;
+            return file_size(path) == e.file.size && sha256_file(path, hex, why) && hex_equals_ci(hex, e.file.sha256);
+        }, err)) return false;
+    if (!write_update_atomic(staging_manifest_path(man.version), text) ||
+        !write_update_atomic(staging_complete_path(man.version), sha256_hex(text))) {
+        err = "无法持久化暂存完成清单"; return false;
+    }
+    return verify_staging(man.version, staging, m, err);
 }
 
 // ---------------------------------------------------------------------------
@@ -710,15 +784,8 @@ inline bool unzip_to(const std::string& zip, const std::string& dst, std::string
     return true;
 }
 
-inline void download_worker() {
+inline void download_worker(ManifestExt man, Plan pl) {
     auto& s = state();
-    ManifestExt man;
-    Plan pl;
-    {
-        std::lock_guard<std::mutex> lk(s.mtx);
-        man = s.man;
-        pl = s.plan;
-    }
     const std::string ver = man.version;
     auto fail = [&](const std::string& why) {
         std::lock_guard<std::mutex> lk(s.mtx);
@@ -728,6 +795,9 @@ inline void download_worker() {
         s.staged = false;
         s.dlEndMs = now_ms();
     };
+    std::string leaseError;
+    UpdateWriterLease writer(leaseError);
+    if (!writer.owns_lock()) { fail(leaseError); return; }
     auto set_phase = [&](const char* p) {
         std::lock_guard<std::mutex> lk(s.mtx);
         s.phase = p;
@@ -737,7 +807,8 @@ inline void download_worker() {
     const std::string staging = join_path(dir, "staging");
     const std::string unpack = join_path(dir, "unpacked");
     if (!ensure_dir(dir)) { fail("无法创建目录：" + dir + "（安装目录不可写？）"); return; }
-    rmtree(staging);
+    if (path_exists(staging_complete_path(ver)) && !::DeleteFileW(rta::platform::from_utf8(staging_complete_path(ver)).c_str())) { fail("无法清除旧暂存完成标记"); return; }
+    if (!rmtree(staging)) { fail("无法清理旧 staging"); return; }
     if (!ensure_dir(staging)) { fail("无法创建 staging：" + staging); return; }
 
     std::map<std::string, std::string> want;
@@ -838,19 +909,9 @@ inline void download_worker() {
         return;
     }
 
-    const int files = count_files(staging);
-    {
-        std::string man_txt = "version=" + ver + "\r\n";
-        man_txt += "deltaUrl=" + man.deltaUrl + "\r\n";
-        man_txt += "stagedFiles=" + std::to_string(files) + "\r\n";
-        man_txt += "skippedFiles=" + std::to_string(pl.unchanged) + "\r\n";
-        man_txt += "downloadBytes=" + std::to_string(pl.downloadBytes) + "\r\n";
-        man_txt += "at=" + std::to_string((long long)time(nullptr)) + "\r\n";
-        std::vector<std::string> rels;
-        list_files_rel(staging, "", rels);
-        for (const auto& r : rels) man_txt += "file=" + r + "\r\n";
-        write_text_file(join_path(dir, "manifest.txt"), man_txt);
-    }
+    std::string completeError;
+    if (!complete_staging(man, pl.missing, staging, completeError)) { fail(completeError); return; }
+    const int files = (int)pl.missing.size();
     {
         std::lock_guard<std::mutex> lk(s.mtx);
         s.phase = "ready";
@@ -864,8 +925,11 @@ inline void download_worker() {
 }
 
 inline bool start_download(std::string& err) {
+    ManifestExt downloadManifest; Plan downloadPlan;
     auto& s = state();
     {
+        UpdateWriterLease writer(err);
+        if (!writer.owns_lock()) return false;
         std::lock_guard<std::mutex> lk(s.mtx);
         if (s.downloading) return true;
         if (s.cr.decision != Decision::UpdateAvailable) {
@@ -877,6 +941,7 @@ inline bool start_download(std::string& err) {
             err = "清单里没有任何可用下载地址";
             return false;
         }
+        downloadManifest = s.man; downloadPlan = s.plan;
         s.downloading = true;
         s.phase = "downloading";
         s.downloaded = 0;
@@ -895,7 +960,11 @@ inline bool start_download(std::string& err) {
         s.perFileFetches = 0;
         s.stagingDir = join_path(version_dir(s.man.version), "staging");
     }
-    std::thread(download_worker).detach();
+    try { std::thread(download_worker, std::move(downloadManifest), std::move(downloadPlan)).detach(); }
+    catch (...) {
+        std::lock_guard<std::mutex> lock(s.mtx); s.downloading = false; s.phase = "error";
+        s.dlError = err = "无法启动更新下载线程"; return false;
+    }
     return true;
 }
 
@@ -943,7 +1012,7 @@ inline std::string progress_json() {
 inline void restore_staging_state() {
     auto& s = state();
     std::lock_guard<std::mutex> lk(s.mtx);
-    if (s.staged) return;
+    if (s.staged || s.downloading) return;
     WIN32_FIND_DATAW fd{};
     HANDLE h = ::FindFirstFileW(rta::platform::from_utf8(join_path(updates_root(), "*")).c_str(), &fd);
     if (h == INVALID_HANDLE_VALUE) return;
@@ -954,9 +1023,9 @@ inline void restore_staging_state() {
         if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) continue;
         const std::string v = rta::platform::detail::narrow(nm);
         const std::string st = join_path(join_path(updates_root(), v), "staging");
-        if (is_dir(st) && count_files(st) > 0) {
-            const std::string bare = (v.size() && (v[0] == 'v' || v[0] == 'V')) ? v.substr(1) : v;
-            if (best.empty() || cmp_versions(bare, best) > 0) best = bare;
+        StagingManifest manifest; std::string error;
+        if (is_dir(st) && verify_staging(v, st, manifest, error)) {
+            if (best.empty() || cmp_versions(v, best) > 0) best = v;
         }
     } while (::FindNextFileW(h, &fd));
     ::FindClose(h);

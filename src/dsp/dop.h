@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <vector>
 #include <cstddef>
+#include <stdexcept>
 
 namespace rta::dsp {
 
@@ -36,6 +37,12 @@ struct DopPackState {
 // 流式版本：相位跨调用保持。frames 必须是 16 的整数倍，否则尾部会被丢掉。
 inline void dop_pack(const double* const* sdm, int channels, size_t frames,
                      std::vector<int32_t>& out, DopPackState& st) {
+    if (channels <= 0 || frames % 16 != 0)
+        throw std::invalid_argument("DoP requires positive channels and whole 16-bit frames");
+    for (int c = 0; c < channels; ++c)
+        for (size_t n = 0; n < frames; ++n)
+            if (sdm[c][n] != -1.0 && sdm[c][n] != 1.0)
+                throw std::invalid_argument("DoP input must contain exactly -1/+1 DSD bits");
     if ((int)st.phaseA.size() != channels) st.phaseA.assign((size_t)channels, 1);
     const size_t carrierFrames = frames / 16;
     out.assign(carrierFrames * (size_t)channels, 0);

@@ -49,6 +49,8 @@
 #include <string>
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
+#include <stdexcept>
 
 namespace rta::dsp {
 
@@ -584,6 +586,15 @@ public:
     long long clamped() const { return clamped_; }     // 误差钳位次数（数值保护）
     long long overload() const { return overload_; }   // 环路限幅器触发次数（输入过载）
     long long nonFinite() const { return nonFinite_; } // 非有限输入次数（防御性清零）
+
+    bool supports_dsd_output() const { return levels_ == 2; }
+
+    // Multi-level SDM is not a one-bit DSD stream. Never silently take its sign.
+    double process_dsd(double x) {
+        if (!supports_dsd_output())
+            throw std::invalid_argument("AHM/multi-level SDM cannot be transported as one-bit DSD");
+        return process(x);
+    }
 
     double process(double x) {
         const size_t sz = (size_t)effectiveOrder_ + 1;

@@ -62,6 +62,8 @@ struct PipelineConfig {
     // 2026-10-25（音质线）：每相位抽头地板。0 = 老行为（T = taps/L，L 大时 T 会小到 4）；
     // 新预设（*-tight）用它把 T 与 L 解耦，否则 44.1→384k 时通带 20 kHz 掉 5 dB。
     int      minTapsPerInput = 0;
+    bool     apodizing = false;
+    double   apodF1 = 0.0, apodF2 = 0.0;
 
     // 等响度补偿（手册 4.2 Loudness）。依 cfg.volumeDb 决定提升量：
     // 音量在上界及以上时提升量为 0 ⟹ 自动旁路 ⟹ 比特完美不受影响。
@@ -100,6 +102,17 @@ struct PipelineConfig {
     double   volumeRampMs  = 200.0;
 };
 
+// Keep the full preset mapping in one production entry point for GUI and CLI.
+inline void apply_filter_preset(PipelineConfig& cfg, const dsp::FilterPreset& fp) {
+    dsp::ResamplerConfig rc;
+    dsp::apply_preset(rc, fp);
+    cfg.taps = rc.totalTaps; cfg.attenDb = rc.attenDb; cfg.transition = rc.transition;
+    cfg.filterWindow = rc.window; cfg.filterPhase = rc.phase;
+    cfg.twoStage = rc.twoStage; cfg.stage2Taps = rc.stage2Taps;
+    cfg.minTapsPerInput = rc.minTapsPerInput;
+    cfg.apodizing = rc.apodizing; cfg.apodF1 = rc.apodF1; cfg.apodF2 = rc.apodF2;
+}
+
 struct PipelineStats {
     bool usedLoudness = false;      // 等响度补偿是否实际生效（音量 >= 上界时为 false）
     bool     bitPerfect = false;
@@ -113,6 +126,8 @@ struct PipelineStats {
     // 各阶段是否实际生效
     bool     usedMatrix = false, usedEq = false, usedDelay = false, usedPeq = false;
     bool     usedConvolution = false, usedResample = false, usedVolume = false;
+    bool     usedPreAtten = false;
+    bool     usedShaper = false;    // Actual dither/noise-shaping execution, not just a request.
     bool     usedReplayGain = false;       // 本次是否乘了 ReplayGain 增益（0 dB ⟹ false，样本逐位未动）
     bool     usedGpuConvolution = false;   // 本次是否真的走了 GPU
     bool     usedChannelGain = false;      // 是否用了每声道增益
@@ -135,11 +150,13 @@ public:
         if (!cfg_.matrix.empty()) return true;
         if (cfg_.shaper != dsp::Shaper::None) return true;
         if (cfg_.volumeEnabled && cfg_.volumeDb != 0.0) return true;
+        if (cfg_.preAttenDb != 0.0) return true;
+        if (cfg_.loudnessEnabled && dsp::replaygain::loudness_volume_db(cfg_.volumeDb, cfg_.replayGainDb) < cfg_.loudness.upperBoundDb) return true;
         if (cfg_.replayGainDb != 0.0) return true;      // ReplayGain 改样本值 ⟹ 不是直通
         for (const auto& c : cfg_.channel) {
             if (!c.eq.empty() || c.delaySamples != 0 || !c.ir.empty() || c.gainDb != 0.0) return true;
         }
-        if (cfg_.peq && cfg_.peq->has_effect()) return true;   // PEQ 全 0dB / bypass 不影响直通
+        if (cfg_.peq && cfg_.peq->needs_processing()) return true;   // PEQ 全 0dB / bypass 不影响直通
         return false;
     }
 
@@ -152,6 +169,7 @@ public:
     // 重建 Pipeline 会重新设计 26 万抽头的滤波器（秒级），跳转会明显卡顿；
     // 这里只把历史清零，配合调用方的"预卷"（提前解码 0.5 秒再丢掉）即可无拖尾。
     void seek_reset() const {
+        if (cfg_.peq) cfg_.peq->reset();
         if (ss_.rs) ss_.rs->reset();
         // 卷积器按 IR 长度分块，跳转时用同一个 IR 重新装载即可清空历史
         for (size_t c = 0; c < ss_.conv.size(); ++c) {
@@ -165,6 +183,10 @@ public:
         for (auto& l : ss_.loud) if (l) l->reset();
         // 2026-10-25：延迟线改持久后，跳转也必须清历史（否则跳转后先吐出上一个位置的尾巴）
         for (auto& d : ss_.delay) d.reset();
+        for (auto& d : ss_.alignDelay) d.reset();
+        ss_.sourceFrames = ss_.outputFrames = 0;
+        ss_.leadingLeft = ss_.leadingFrames;
+        ss_.finished = false;
     }
 
     bool willBeBitPerfect(const AudioBuffer& in) const {
@@ -185,6 +207,38 @@ public:
         return orr == in.rate && ob > in.bits && oc == in.channels && !hasAnyProcessing();
     }
 
+    // Normal EOF preserves source duration. Algorithm latency is removed; authored
+    // channel delay/IR tails are effects and do not extend the playback timeline.
+    AudioBuffer finish(PipelineStats* stOut = nullptr) const {
+        AudioBuffer tail;
+        if (!ss_.ready || ss_.finished) return tail;
+        tail.rate = cfg_.outRate ? cfg_.outRate : ss_.inRate;
+        tail.channels = cfg_.outChannels ? cfg_.outChannels : ss_.inChannels;
+        tail.bits = cfg_.outBits ? cfg_.outBits : ss_.inBits;
+        const size_t target = target_frames();
+        ss_.draining = true;
+        try {
+            // Zero input is pushed through the actual stateful stages, never appended
+            // after the pipeline. The bound depends only on known algorithm latency.
+            size_t budget = (size_t)std::ceil((double)ss_.leadingFrames * ss_.inRate / tail.rate) + 8;
+            while (ss_.outputFrames < target && budget > 0) {
+                const size_t count = std::min<size_t>(4096, budget);
+                AudioBuffer zero;
+                zero.rate = ss_.inRate; zero.channels = ss_.inChannels;
+                zero.bits = ss_.inBits; zero.isFloat = ss_.inFloat;
+                zero.raw.assign(count * (size_t)zero.channels, 0);
+                auto chunk = process(zero, stOut);
+                tail.raw.insert(tail.raw.end(), chunk.raw.begin(), chunk.raw.end());
+                budget -= count;
+            }
+            if (ss_.outputFrames != target) throw std::runtime_error("DSP EOF drain did not reach source duration");
+        } catch (...) { ss_.draining = false; throw; }
+        ss_.draining = false;
+        ss_.finished = true;
+        if (stOut) stOut->outFrames = tail.frames();
+        return tail;
+    }
+
     AudioBuffer process(const AudioBuffer& in, PipelineStats* stOut = nullptr) const {
         PipelineStats st;
         st.inRate = in.rate; st.inBits = in.bits; st.inFrames = in.frames();
@@ -200,10 +254,11 @@ public:
         out.isFloat = false;
 
         // ---- 路径 1：逐位直通 ----
-        if (willBeBitPerfect(in)) {
-            out.bits = in.bits; out.channels = in.channels; out.isFloat = in.isFloat;
+        if (!ss_.draining && willBeBitPerfect(in)) {
+            out.rate = in.rate; out.bits = in.bits; out.channels = in.channels; out.isFloat = in.isFloat;
             out.raw = in.raw;
             st.bitPerfect = true;
+            st.outRate = in.rate; st.outBits = in.bits;
             st.outChannels = in.channels;
             st.outFrames = out.frames();
             if (stOut) *stOut = st;
@@ -211,7 +266,7 @@ public:
         }
 
         // ---- 路径 2：无损展宽 ----
-        if (willBeZeroPad(in)) {
+        if (!ss_.draining && willBeZeroPad(in)) {
             const int shift = st.outBits - in.bits;
             out.raw.resize(in.raw.size());
             for (size_t i = 0; i < in.raw.size(); ++i)
@@ -230,6 +285,8 @@ public:
         // 首次调用（或配置变化）时建立持久流式状态；此后跨调用保持
         if (!ss_.ready || ss_.inRate != in.rate || ss_.inChannels != in.channels)
             prepare_stream(in, outCh);
+        if (ss_.finished) throw std::logic_error("DSP process after finish requires seek_reset");
+        if (!ss_.draining) ss_.sourceFrames += nIn;
         st.prepareMs = ss_.prepareMs;
         st.coeffBytes = ss_.coeffBytes;
 
@@ -253,6 +310,7 @@ public:
         if (cfg_.preAttenDb != 0.0) {
             const double g = std::pow(10.0, cfg_.preAttenDb / 20.0);
             for (auto& p : planes) for (auto& val : p) val *= g;
+            st.usedPreAtten = true;
         }
 
         // ---- 阶段 2：Matrix ----
@@ -289,7 +347,7 @@ public:
 
         // ---- 阶段 3 前置：20 段 PEQ（输入采样率，现有文件 EQ 之前）----
         // 独立于 cfg_.channel（即使没有任何通道配置也要生效）；全 0dB/bypass 时快速路径直通。
-        if (cfg_.peq && cfg_.peq->has_effect()) {
+        if (cfg_.peq && cfg_.peq->needs_processing()) {
             for (int c = 0; c < outCh && c < (int)work.size(); ++c)
                 cfg_.peq->process((size_t)c, work[(size_t)c].data(), work[(size_t)c].size());
             st.usedPeq = true;
@@ -389,6 +447,11 @@ public:
             }
         }
 
+        // Every output channel shares the same convolution FIFO latency, including
+        // channels without an IR, so removing it never moves channels relative to one another.
+        for (int c = 0; c < outCh; ++c)
+            for (auto& v : work[(size_t)c]) v = ss_.alignDelay[(size_t)c].process(v);
+
         // ---- 阶段 5：重采样 ----
         if (st.outRate != in.rate && ss_.rs) {
             // ★ 使用持久重采样器：相位累加器与历史跨调用保持
@@ -410,7 +473,15 @@ public:
         }
 
         // ---- 阶段 6：音量 ----
-        const size_t nOut = work.empty() ? 0 : work[0].size();
+        const size_t produced = work.empty() ? 0 : work[0].size();
+        const size_t skip = std::min(ss_.leadingLeft, produced);
+        ss_.leadingLeft -= skip;
+        const size_t nOut = std::min(produced - skip, target_frames() - ss_.outputFrames);
+        for (auto& w : work) {
+            w.erase(w.begin(), w.begin() + (ptrdiff_t)skip);
+            w.resize(nOut);
+        }
+        ss_.outputFrames += nOut;
         // ---- 等响度补偿（在音量之后、量化之前）----
         // 音量 >= 上界时 bass_db()/treble_db() 均为 0，Loudness::process 会直接返回，
         // 因此 0 dB 场景下这一段是【完全旁路】，不影响比特完美。
@@ -423,12 +494,13 @@ public:
 
         if (cfg_.volumeEnabled && ss_.vol) {
             // 持久音量：渐变跨调用连续，不会在每个分块边界重启
-            for (auto& w : work) ss_.vol->process(w.data(), w.size());
+            ss_.vol->process_planar(work);
             st.usedVolume = (cfg_.volumeDb != 0.0);
         }
 
         // ---- 阶段 7：抖动/整形 + 量化 ----
         out.raw.resize(nOut * (size_t)outCh);
+        st.usedShaper = nOut > 0 && !ss_.quant.empty() && ss_.quant[0].adds_dither_or_shaping();
         std::vector<dsp::Quantizer>& qz = ss_.quant;   // ★ 持久：噪声整形误差历史跨调用保持
         for (size_t n = 0; n < nOut; ++n) {
             for (int c = 0; c < outCh; ++c) {
@@ -468,17 +540,28 @@ private:
     std::vector<std::unique_ptr<dsp::GpuStreamConvolver>> convGpu;
         std::vector<std::unique_ptr<dsp::Loudness>> loud;             // 每声道（各自持有滤波状态）
         // 每输出声道延迟线（2026-10-25 修复：原先每块新建 ⟹ 每块丢 delaySamples 个样本）
-        std::vector<dsp::DelayLine> delay;
+        std::vector<dsp::DelayLine> delay, alignDelay;
+        int inBits = 0;
+        bool inFloat = false, draining = false, finished = false;
+        size_t sourceFrames = 0, outputFrames = 0, leadingFrames = 0, leadingLeft = 0;
         double prepareMs = 0.0;      // prepare_stream() 耗时（滤波器设计 + 状态分配）
         size_t coeffBytes = 0;       // 重采样器系数表字节数（多相 L × 每相抽头 × 8）
     };
     mutable StreamState ss_;
+
+    size_t target_frames() const {
+        const uint64_t outRate = cfg_.outRate ? cfg_.outRate : ss_.inRate;
+        const uint64_t n = (uint64_t)ss_.sourceFrames;
+        return (size_t)((n / ss_.inRate) * outRate +
+            ((n % ss_.inRate) * outRate + ss_.inRate - 1) / ss_.inRate);
+    }
 
     void prepare_stream(const AudioBuffer& in, int outCh) const {
         const auto t_prep_0 = std::chrono::steady_clock::now();
         ss_ = StreamState{};
         ss_.inRate = in.rate;
         ss_.inChannels = in.channels;
+        ss_.inBits = in.bits; ss_.inFloat = in.isFloat;
 
         const uint32_t outRate = cfg_.outRate ? cfg_.outRate : in.rate;
         if (outRate != in.rate) {
@@ -486,6 +569,7 @@ private:
             rc.inRate = in.rate; rc.outRate = outRate; rc.channels = outCh;
             rc.totalTaps = cfg_.taps; rc.attenDb = cfg_.attenDb; rc.transition = cfg_.transition;
             rc.window = cfg_.filterWindow; rc.phase = cfg_.filterPhase;
+            rc.apodizing = cfg_.apodizing; rc.apodF1 = cfg_.apodF1; rc.apodF2 = cfg_.apodF2;
             rc.twoStage = cfg_.twoStage; rc.stage2Taps = cfg_.stage2Taps;
             rc.minTapsPerInput = cfg_.minTapsPerInput;   // 2026-10-25：每相位抽头地板透传
             ss_.rs = std::make_unique<dsp::PolyphaseResampler>(rc);
@@ -496,6 +580,7 @@ private:
             ss_.vol->set_sample_rate((double)outRate);
             ss_.vol->set_ramp_ms(cfg_.volumeRampMs);
             ss_.vol->set_gain_db(cfg_.volumeDb);
+            ss_.vol->snap();
         }
         const int ob = cfg_.outBits ? cfg_.outBits : in.bits;
         if (cfg_.shaper != dsp::Shaper::None || ob < in.bits) {
@@ -543,6 +628,16 @@ private:
                 ss_.eqPerCh[(size_t)c] = cfg_.channel[(size_t)c].eq.size();
             }
         }
+        size_t convLatency = 0;
+        for (const auto& conv : ss_.conv) if (conv) convLatency = std::max(convLatency, conv->latency());
+        ss_.alignDelay.resize((size_t)outCh);
+        for (int c = 0; c < outCh; ++c) {
+            const size_t own = ss_.conv[(size_t)c] ? ss_.conv[(size_t)c]->latency() : 0;
+            ss_.alignDelay[(size_t)c].set_samples(convLatency - own);
+        }
+        const double delay = (double)convLatency + (ss_.rs ? ss_.rs->latencyInputSamples() : 0.0);
+        ss_.leadingFrames = (size_t)std::floor(delay * outRate / in.rate);
+        ss_.leadingLeft = ss_.leadingFrames;
         // 多相系数表大小：L 相 × 每相抽头 × 8 字节（两级时第一级另算，量级相同）
         if (ss_.rs) {
             const uint32_t a = in.rate, b = outRate;

@@ -46,8 +46,7 @@ static const char* kFixtureExtractNormal = R"json({
         "pageid": 90238,
         "ns": 0,
         "title": "ZARD",
-        "extract": "ZARD是以日本女歌手坂井泉水为核心的音乐团体。
-代表作有《不要认输》等。"
+        "extract": "ZARD是以日本女歌手坂井泉水为核心的音乐团体。\n代表作有《不要认输》等。"
       }
     ]
   }
@@ -112,10 +111,7 @@ static const char* kFixtureExtractDisambig = R"json({
         "pageid": 401777,
         "ns": 0,
         "title": "Steve Roach",
-        "extract": "Steve Roach may refer to:
-
-Steve Roach (musician) (born 1955)
-Steve Roach (rugby league)"
+        "extract": "Steve Roach may refer to:\n\nSteve Roach (musician) (born 1955)\nSteve Roach (rugby league)"
       }
     ]
   }

@@ -1,4 +1,4 @@
-# make_dist.ps1 - build the ONE official release package (Full / self-contained).
+﻿# make_dist.ps1 - build the ONE official release package (Full / self-contained).
 #
 # Policy since 1.0.2:
 #   * There is no "Lite" package any more. Every release is the official
@@ -15,7 +15,7 @@
 #
 # Usage: powershell -File tools/make_dist.ps1 [-Version 1.0.2] [-SkipGpuBuild]
 param(
-    [string]$Version = "1.3.13",
+    [string]$Version = "",
     [switch]$SkipGpuBuild
 )
 
@@ -27,6 +27,13 @@ $dist = Join-Path $root 'dist'
 $rocm = 'C:\Program Files\AMD\ROCm\7.2'
 
 function Fail($msg) { Write-Host "FAILED: $msg"; exit 1 }
+
+$versionHeader = Get-Content -LiteralPath (Join-Path $root 'src\version.h') -Raw
+if ($versionHeader -notmatch '#define\s+RLPLAYER_VERSION\s+"([0-9]+\.[0-9]+\.[0-9]+)"') { Fail 'Cannot read source version' }
+$sourceVersion = $Matches[1]
+if ($Version -and $Version -ne $sourceVersion) { Fail "Requested version $Version differs from source $sourceVersion" }
+$Version = $sourceVersion
+
 
 Write-Host "=== build ==="
 & cmake --build $B

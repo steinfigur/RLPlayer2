@@ -1,0 +1,46 @@
+{
+  "baseline": "c9b113ac44f23c820692a80fe3aeff088fa2c954",
+  "compiler": "LLVM clang++ 23.1.4 / Windows x64 / CMake Release",
+  "full_local": {
+    "ctest_total": 115,
+    "ctest_failures": 0,
+    "ctest_skips": 0,
+    "internal_skip_only": [
+      "gpu_bridge",
+      "ffmpeg_matrix"
+    ],
+    "excluded": [
+      "wasapi_shared",
+      "capture"
+    ],
+    "seconds": 622.79
+  },
+  "final_supplement": {
+    "targets": [
+      "ffmpeg_matrix",
+      "audit_verification_gates",
+      "audit_app"
+    ],
+    "exit_code": 0,
+    "total": 3,
+    "failed": 0,
+    "skipped": 0,
+    "internal_skip_only": 0,
+    "checks": {
+      "ffmpeg_matrix": 38,
+      "audit_verification_gates": 17,
+      "audit_app": 53
+    }
+  },
+  "official_codec_archive_sha256": "3ac59c1b1d9ce9b0f95b3027a6db6680a6307f1d8f389f24b73aa9def893164e",
+  "not_verified": [
+    "physical DAC/ASIO drivers",
+    "GPU numerical execution",
+    "audible playback",
+    "live feedback/update services",
+    "power-loss durability",
+    "full release packaging"
+  ],
+  "remote_gate": "https://github.com/steinfigur/RLPlayer2/actions/workflows/ci.yml",
+  "evidence_directory": "../review-fixes (outside source repository)"
+}

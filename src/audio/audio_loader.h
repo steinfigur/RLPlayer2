@@ -561,6 +561,15 @@ inline bool read_wav_stream_pipe(HANDLE hPipe, HANDLE hProcess, AudioBuffer& ab,
             Sleep(0);
         }
     }
+    if (leftoverCount != 0 || ab.raw.size() % (size_t)ab.channels != 0) {
+        if (errOut) *errOut = "WAV 流结束于不完整采样帧";
+        return false;
+    }
+    if (hdr.dataDeclaredBytes != 0xFFFFFFFFu &&
+        ab.raw.size() * (size_t)bytesPer != hdr.dataDeclaredBytes) {
+        if (errOut) *errOut = "WAV 流数据长度与声明不符（截断/多余数据）";
+        return false;
+    }
     return true;
 }
 
@@ -599,7 +608,12 @@ inline DsdFileLayout probe_dsd_layout(const std::string& path) {
     FILE* f = dsd_fopen(path, L"rb", "rb");
     if (!f) throw std::runtime_error("无法打开文件: " + path);
     struct Guard { FILE* f; ~Guard() { if (f) std::fclose(f); } } g{ f };
+    if (_fseeki64(f, 0, SEEK_END) != 0) throw std::runtime_error("DSD 文件定长失败");
+    const auto fileEnd = _ftelli64(f);
+    if (fileEnd < 0) throw std::runtime_error("DSD 文件定长失败");
+    const uint64_t fileSize = (uint64_t)fileEnd;
     auto rd = [&](uint64_t off, void* buf, size_t n) -> size_t {
+        if (off > fileSize || n > fileSize - off) return 0;
         if (_fseeki64(f, (long long)off, SEEK_SET) != 0) return 0;
         return std::fread(buf, 1, n, f);
     };
@@ -617,10 +631,10 @@ inline DsdFileLayout probe_dsd_layout(const std::string& path) {
             uint8_t ch[12];
             if (rd(off, ch, 12) != 12) break;
             const uint64_t sz = rdl64(ch + 4);
-            if (sz < 12) break;
+            if (sz < 12 || sz > fileSize - off) throw std::runtime_error("DSF 块被截断或长度非法");
             if (std::memcmp(ch, "fmt ", 4) == 0) {
                 if (sz < 52) throw std::runtime_error("DSF fmt 块长度异常");
-                std::vector<uint8_t> fb((size_t)sz);
+                std::vector<uint8_t> fb(40);
                 if (rd(off + 12, fb.data(), fb.size()) != fb.size())
                     throw std::runtime_error("DSF fmt 块被截断");
                 const uint32_t fmtId = rdl32(fb.data() + 4);
@@ -648,11 +662,13 @@ inline DsdFileLayout probe_dsd_layout(const std::string& path) {
         }
         if (!haveFmt) throw std::runtime_error("DSF 缺少 fmt 块");
         if (!haveData) throw std::runtime_error("DSF 缺少 data 块");
-        const uint64_t needBytes  = (sampleCnt + 7) / 8;
+        const uint64_t needBytes  = (sampleCnt / 8 + (sampleCnt % 8 != 0));
+        if (needBytes > L.dataSize / chNum) throw std::runtime_error("DSF 声明有效数据超出 data 块");
         const uint64_t fullBlocks = needBytes / blockSize;
         const uint64_t remBytes   = needBytes % blockSize;
         const uint64_t needData   = (fullBlocks + (remBytes ? 1 : 0)) * (uint64_t)chNum * blockSize;
-        if (L.dataSize < (uint64_t)chNum * 8) throw std::runtime_error("DSF data 块过短");
+        const uint64_t packedNeed = fullBlocks * (uint64_t)chNum * blockSize + remBytes * chNum;
+        if (L.dataSize < packedNeed) throw std::runtime_error("DSF 有效数据被截断");
         L.isDsf = true;
         L.rate = rate; L.channels = (int)chNum;
         L.bitsPerChannel = sampleCnt;
@@ -675,6 +691,7 @@ inline DsdFileLayout probe_dsd_layout(const std::string& path) {
                                     "请转成标准 .dff/.dsf 再播放。（文件=" + path + "）");
         }
         const uint64_t frm8Size = rdb64(h + 4);
+        if (frm8Size < 4 || frm8Size > fileSize - 12) throw std::runtime_error("DFF FRM8 块被截断");
         const uint64_t end = 12 + frm8Size;
         uint32_t rate = 0, declaredCh = 0;
         std::string cmpType;
@@ -683,7 +700,7 @@ inline DsdFileLayout probe_dsd_layout(const std::string& path) {
             uint8_t ch[12];
             if (rd(off, ch, 12) != 12) break;
             const uint64_t sz = rdb64(ch + 4);
-            if (sz > (1ull << 62)) break;
+            if (sz > end - off - 12) throw std::runtime_error("DFF 块被截断");
             if (std::memcmp(ch, "PROP", 4) == 0) {
                 std::vector<uint8_t> body((size_t)sz);
                 if (rd(off + 12, body.data(), body.size()) != body.size())
@@ -693,7 +710,7 @@ inline DsdFileLayout probe_dsd_layout(const std::string& path) {
                     while (q + 12 <= body.size()) {
                         const uint64_t ss = rdb64(body.data() + q + 4);
                         const uint8_t* p = body.data() + q + 12;
-                        if (q + 12 + ss > body.size()) break;
+                        if (ss > body.size() - q - 12) throw std::runtime_error("DFF PROP 子块被截断");
                         if (std::memcmp(body.data() + q, "FS  ", 4) == 0 && ss >= 4) rate = rdb32(p);
                         else if (std::memcmp(body.data() + q, "CHNL", 4) == 0 && ss >= 2) declaredCh = rdb16(p);
                         else if (std::memcmp(body.data() + q, "CMPR", 4) == 0 && ss >= 4) cmpType.assign((const char*)p, 4);
@@ -768,7 +785,7 @@ public:
         if (!f_) { if (errOut) *errOut = "无法打开文件: " + path; return false; }
         ch_ = layout_.channels;
         M_ = layout_.rate / outRate_;
-        totalFrames_ = (size_t)(layout_.bitsPerChannel / M_);
+        totalFrames_ = dec_[0]->output_frames(layout_.bitsPerChannel);
         readBlock_ = layout_.isDsf ? layout_.blockSize : 4096u;
         if (readBlock_ == 0) readBlock_ = 4096u;
         scratch_.assign(readBlock_, 0);
@@ -844,6 +861,8 @@ private:
         const uint64_t byteOff = b * blockBytes;
         if (byteOff >= layout_.bytesPerChannel) return false;
         const size_t thisBlock = (size_t)std::min<uint64_t>(blockBytes, layout_.bytesPerChannel - byteOff);
+        const size_t previousPending = pendCount();
+        const size_t validBits = (size_t)std::min<uint64_t>((uint64_t)thisBlock * 8, layout_.bitsPerChannel - curBit_);
         for (int c = 0; c < ch_; ++c) {
             uint64_t src = 0;
             if (layout_.isDsf) {
@@ -851,20 +870,24 @@ private:
                 const uint64_t stride = layout_.paddedLastBlock ? (uint64_t)layout_.blockSize : (uint64_t)thisBlock;
                 src = base + (uint64_t)c * stride;
             } else {
-                src = layout_.dataOffset + (uint64_t)c * layout_.bytesPerChannel + byteOff;
+                src = layout_.dataOffset + byteOff * (uint64_t)ch_;
             }
-            if (scratch_.size() < thisBlock) scratch_.resize(thisBlock, 0);
-            size_t got = 0;
-            if (_fseeki64(f_, (long long)src, SEEK_SET) == 0)
-                got = std::fread(scratch_.data(), 1, thisBlock, f_);
-            if (got < thisBlock) std::memset(scratch_.data() + got, 0, thisBlock - got);
+            if (scratch_.size() < thisBlock) scratch_.resize(thisBlock);
+            // DFF stores one byte per channel in each interleaved frame.
+            const size_t diskBytes = layout_.isDsf ? thisBlock : thisBlock * (size_t)ch_;
+            io_.resize(diskBytes);
+            if (_fseeki64(f_, (long long)src, SEEK_SET) != 0)
+                throw std::runtime_error("DSD 流式 seek 失败，偏移=" + std::to_string(src));
+            if (std::fread(io_.data(), 1, diskBytes, f_) != diskBytes)
+                throw std::runtime_error("DSD 有效数据短读/截断，偏移=" + std::to_string(src));
+            for (size_t i = 0; i < thisBlock; ++i)
+                scratch_[i] = io_[layout_.isDsf ? i : i * (size_t)ch_ + (size_t)c];
             if (layout_.isDsf)
                 for (size_t i = 0; i < thisBlock; ++i) scratch_[i] = dsd_detail::reverse_bits8(scratch_[i]);
-            dec_[(size_t)c]->process_bits(scratch_.data(), thisBlock * 8, pending_[(size_t)c]);
+            dec_[(size_t)c]->process_bits(scratch_.data(), validBits, pending_[(size_t)c]);
         }
-        curBit_ += (uint64_t)thisBlock * 8ull;
-        absFrames_ = curBit_ / (uint64_t)M_;
-        pendStart_ = absFrames_ - (uint64_t)pendCount();
+        curBit_ += validBits;
+        absFrames_ += pendCount() - previousPending;
         return true;
     }
 
@@ -881,7 +904,7 @@ private:
     dsp::IntegratorConfig cfg_;
     std::vector<std::unique_ptr<dsp::DsdDecimator>> dec_;
     std::vector<std::vector<double>> pending_;
-    std::vector<uint8_t> scratch_;
+    std::vector<uint8_t> scratch_, io_;
 };
 
 

@@ -103,6 +103,11 @@ using rta::render::SinkOpenOpts;
 // 必须放在标准库之后：room_transport_wasapi.h 内部用 std::this_thread::sleep_for。
 #include <cmath>
 #include "dsp/room_correction.h"
+#include "net/request_values.h"
+#include "net/request_numeric.h"
+#include "engine/playback_integrity.h"
+#include "net/update_process.h"
+#include "net/cache_file.h"
 #include "dsp/room_measurement.h"
 #include "dsp/room_transport_wasapi.h"
 
@@ -145,6 +150,7 @@ struct PlayParams {
     bool   loudness = false;
     bool   isp = true;         // 过采样峰值保护
     bool   twoStage = true;    // 两段式升频
+    bool   twoStageExplicit = false;
     // ---- ReplayGain（261027-01 #2）----
     // rgMode: off | track | album（默认 off ⟹ 增益 0 dB ⟹ 管线整段跳过 ⟹ 逐位直通）
     // rgClip: 防削波（applied = min(gain, -peak_dBFS)）。改样本值 ⟹ 开启后**不是 bit-perfect**。
@@ -238,6 +244,7 @@ struct PlayerState {
     std::string signal;       // 本次播放的信号链快照（JSON），供界面画"每一环"
     // 2026-10-23（用户 261023-02 #1）：本次播放的 bit-perfect 结论（direct/yes/no）+ 原因。
     // 在信号链 JSON 生成处一并写入，/api/status 直接带出，供底栏常驻徽标使用。
+    eng::PlaybackIntegrity pipelineIntegrity{"unknown", "等待实际输出样本"};
     std::string bpState;
     std::string bpWhy;
     // ---- 输出格式自证（2026-10-26 用户 261025-02 #2/#5）----
@@ -257,8 +264,8 @@ struct PlayerState {
     std::string outModFamily;
     int         outModOrder = 0;
     std::string outFallbackWhy;
-    double outRate = 0;
-    int    outBits = 0;
+    std::atomic<double> outRate{0};
+    std::atomic<int> outBits{0};
     // ---- ReplayGain 自证（261027-01 #2；/api/status 的 rg / rgDb / rgClip）----
     // 为什么要报：mode=off 时用户必须能证明"输出逐位没动"，mode=track/album 时又必须能看到
     // 实际乘了多少 dB（标签值 vs 防削波改过的值）。只有后端说出来，这两件事才可证伪。
@@ -335,7 +342,13 @@ static void dlog(const std::string& s) {
     if (g_log.size() > 400) g_log.pop_front();
     g_log.push_back(s);
 }
+// HTTP commands own the playback thread. Never held by the playback/producer threads.
+static std::mutex g_commandMx;
+static std::mutex g_paramsMx;
 static PlayParams  g_params;      // 最近一次播放参数，跳曲时沿用
+static PlayParams params_snapshot() { std::lock_guard<std::mutex> lk(g_paramsMx); return g_params; }
+static void params_store(const PlayParams& p) { std::lock_guard<std::mutex> lk(g_paramsMx); g_params = p; }
+
 
 // ---------------- 进程内存遥测（2026-10-25 大 DSD 文件"卡死"取证） ----------------
 // 为什么必须自己量：外部按秒采样会漏掉解码阶段的瞬时峰值（整曲解成 double 平面只在几秒内存在），
@@ -393,6 +406,24 @@ static std::string jesc(const std::string& s) {
         }
     }
     return o;
+}
+
+// Called with PlayerState::mtx held; signal and status receive the same execution result.
+static void signal_string(std::string& json, const char* key, const std::string& value) {
+    const std::string token = std::string("\"") + key + "\":\"";
+    const auto found = json.find(token);
+    if (found == std::string::npos) return;
+    const size_t begin = found + token.size();
+    size_t end = begin;
+    while (end < json.size() && json[end] != '"') { if (json[end] == '\\') ++end; ++end; }
+    json.replace(begin, end - begin, jesc(value));
+}
+static void publish_integrity_locked(PlayerState& ps) {
+    auto result = ps.pipelineIntegrity;
+    if (ps.volDb.load() != ps.startDb.load()) result = {"no", "实时音量改变"};
+    ps.bpState = result.state; ps.bpWhy = result.reason;
+    signal_string(ps.signal, "bitPerfect", result.state);
+    signal_string(ps.signal, "bitPerfectWhy", result.reason);
 }
 
 static std::string urlDecode(const std::string& s) {
@@ -505,7 +536,7 @@ static double saved_volume_setting() {
         if (!line.empty() && line.back() == '\r') line.pop_back();
         if (line.rfind("volume=", 0) == 0) {
             const std::string v = line.substr(7);
-            if (!v.empty()) { try { return std::stod(v); } catch (...) { break; } }
+            if (!v.empty()) { try { double db = rta::net::request_number(v, "saved volume"); if (db >= -120.0 && db <= 0.0) return db; } catch (const rta::net::InvalidRequest&) { break; } }
         }
     }
     return -60.0;
@@ -542,15 +573,15 @@ static PlayParams parseForm(const std::string& body) {
         else if (k == "filterNx") p.filterNx = v;
         else if (k == "shaper")   p.shaper = v;
         else if (k == "rate")     p.rate = v;
-        else if (k == "volume")   { p.volume = atof(v.c_str()); sawVolume = true; }
+        else if (k == "volume")   { p.volume = rta::net::request_number(v, k.c_str()); sawVolume = true; }
         else if (k == "gpu")      p.gpu = (v == "1");
         else if (k == "isp")      p.isp = (v == "1");
-        else if (k == "twostage") p.twoStage = (v == "1");
-        else if (k == "dsd")      p.dsd = atoi(v.c_str());
-        else if (k == "modorder") p.modOrder = atoi(v.c_str());
+        else if (k == "twostage") { p.twoStage = (v == "1"); p.twoStageExplicit = true; }
+        else if (k == "dsd")      p.dsd = rta::net::request_integer(v, k.c_str());
+        else if (k == "modorder") p.modOrder = rta::net::request_integer(v, k.c_str());
         else if (k == "modfamily") p.modFamily = v;
-        else if (k == "oobgain")   p.oobGain = atof(v.c_str());
-        else if (k == "ahmbits")   p.ahmBits = atoi(v.c_str());
+        else if (k == "oobgain")   p.oobGain = rta::net::request_number(v, k.c_str());
+        else if (k == "ahmbits")   p.ahmBits = rta::net::request_integer(v, k.c_str());
         else if (k == "gpuvendor") p.gpuVendor = v;
         else if (k == "dsdnative") p.dsdNative = (v == "1");
         else if (k == "directsdm") p.directSdm = (v == "1");
@@ -560,41 +591,41 @@ static PlayParams parseForm(const std::string& body) {
         else if (k == "loudness") p.loudness = (v == "1");
         else if (k == "rgmode")   p.rgMode = v;
         else if (k == "rgclip")   p.rgClip = (v == "1" || v == "true");
-        else if (k == "buffer")   p.bufferMs = std::max(10, atoi(v.c_str()));
+        else if (k == "buffer")   p.bufferMs = std::max(10, rta::net::request_integer(v, k.c_str()));
         else if (k == "device")   p.device = v;
-        else if (k == "bits")     p.bits = atoi(v.c_str());
-        else if (k == "taps")     p.taps = atoi(v.c_str());
-        else if (k == "atten")    p.atten = atof(v.c_str());
-        else if (k == "transition") p.transition = atof(v.c_str());
+        else if (k == "bits")     p.bits = rta::net::request_integer(v, k.c_str());
+        else if (k == "taps")     p.taps = rta::net::request_integer(v, k.c_str());
+        else if (k == "atten")    p.atten = rta::net::request_number(v, k.c_str());
+        else if (k == "transition") p.transition = rta::net::request_number(v, k.c_str());
         else if (k == "phase")    p.phase = v;
-        else if (k == "modcut")   p.modCutoff = atof(v.c_str());
-        else if (k == "moddith")  p.modDither = atof(v.c_str());
+        else if (k == "modcut")   p.modCutoff = rta::net::request_number(v, k.c_str());
+        else if (k == "moddith")  p.modDither = rta::net::request_number(v, k.c_str());
         else if (k == "ir")       p.convIr = v;
         // 房间校正自动应用（B3）：与设置页「声音校准 → 自动应用校正」同一个键
         else if (k == "roomcorrauto") { p.roomCorrAuto = !(v == "0" || v == "false"); sawRoomAuto = true; }
         else if (k == "eq")       p.eqFile = v;
         else if (k == "irgpu")    p.convGpu = (v == "1");
-        else if (k == "ramp")     p.volRamp = atof(v.c_str());
+        else if (k == "ramp")     p.volRamp = rta::net::request_number(v, k.c_str());
         else if (k == "sdmfilt")   p.sdmFilter = v;
         else if (k == "sdmfiltnx") p.sdmFilterNx = v;
         else if (k == "backend") { p.backend = v; sawBackend = true; }
         // naahost：NAA 已删除，老配置里的这一行忽略（不报错，避免用户配置迁移失败）
         else if (k == "upnpdev")  p.upnpDev = v;
-        else if (k == "channels") p.outChannels = atoi(v.c_str());
+        else if (k == "channels") p.outChannels = rta::net::request_integer(v, k.c_str());
         else if (k == "trim") {
             std::istringstream ts(v);
             std::string tv;
-            for (int i = 0; i < 8 && std::getline(ts, tv, ','); ++i) p.trim[i] = atof(tv.c_str());
+            for (int i = 0; i < 8 && std::getline(ts, tv, ','); ++i) p.trim[i] = rta::net::request_number(tv, "trim");
         }
         else if (k == "inbackend") p.inBackend = v;
         else if (k == "indev")    p.inDevice = v;
-        else if (k == "inoffset") p.inOffset = atoi(v.c_str());
-        else if (k == "inbuf")    p.inBufferMs = std::max(10, atoi(v.c_str()));
+        else if (k == "inoffset") p.inOffset = rta::net::request_integer(v, k.c_str());
+        else if (k == "inbuf")    p.inBufferMs = std::max(10, rta::net::request_integer(v, k.c_str()));
         else if (k == "inmon")    p.inMonitor = (v == "1");
-        else if (k == "srcbits") p.srcBits = atoi(v.c_str());
+        else if (k == "srcbits") p.srcBits = rta::net::request_integer(v, k.c_str());
         // CUE 分轨区间（秒，浮点）。不带 cue_start ⟹ 整首（cueStart 保持 -1）。
-        else if (k == "cue_start") p.cueStart = atof(v.c_str());
-        else if (k == "cue_end")   p.cueEnd   = atof(v.c_str());
+        else if (k == "cue_start") p.cueStart = rta::net::request_number(v, "cue_start");
+        else if (k == "cue_end")   p.cueEnd   = rta::net::request_number(v, "cue_end");
         else if (k == "rid")     p.remoteId = v;
         else if (k == "rsuffix") p.remoteSuffix = v;
         else if (k == "rtitle")  p.remoteTitle = v;
@@ -610,6 +641,13 @@ static PlayParams parseForm(const std::string& body) {
     // 不带 roomcorrauto= ⟹ 用已保存设置（缺键默认开）。反面：脚本漏参数不该悄悄关掉校正，
     // 也不该在用户明确关过之后又自己打开 —— 只有「有键」才算用户的真实意图。
     if (!sawRoomAuto) p.roomCorrAuto = saved_roomcorr_auto();
+    if (!p.backend.empty() && p.backend != "wasapi" && p.backend != "wasapi-shared" &&
+        p.backend != "asio" && p.backend != "upnp" && p.backend != "null")
+        throw rta::net::InvalidRequest("Unsupported output backend: " + p.backend);
+    if (p.volume < -120.0 || p.volume > 0.0) throw rta::net::InvalidRequest("volume must be in [-120, 0]");
+    if (p.outChannels < 0 || p.outChannels > 8) throw rta::net::InvalidRequest("channels must be in [0, 8]");
+    if (p.dsd >= 64 && rta::dsp::parse_modulator_family(p.modFamily) == rta::dsp::ModulatorFamily::Ahm)
+        throw rta::net::InvalidRequest("AHM produces multi-level samples and cannot feed 1-bit DSD/DoP");
     return p;
 }
 
@@ -697,6 +735,7 @@ public:
     }
     size_t buffer_frames() const override { return ao_.buffer_frames() ? (size_t)ao_.buffer_frames() : 9600; }
     void set_live_gain_db(double db) override { ao_.set_live_gain_db(db); }
+    void set_dop_mode(bool dop) override { ao_.set_dop_mode(dop); }
     bool wait_event(int ms) override { return ao_.wait_event(ms); }
     long long last_pad() const override { return ao_.last_pad(); }
     size_t write_one_period(const int32_t* pcm, size_t frames) override { return ao_.write_one_period(pcm, frames); }
@@ -1127,6 +1166,8 @@ public:
     size_t buffer_frames() const override { return period_ ? period_ : 1024; }
     // ASIO 没有独立暂停。暂停时上层不再写，环被回调抽空后自然输出静音，
     // 这样不必 stop/start 驱动（重启驱动会有咔哒声，还可能丢时钟）。
+    void set_live_gain_db(double db) override { drv_.set_live_gain_db(db); }
+    void set_dop_mode(bool dop) override { drv_.set_dop_mode(dop); }
     void pause() override {}
     void resume() override {}
     size_t write_one_period(const int32_t* pcm, size_t frames) override {
@@ -1429,7 +1470,7 @@ static bool play_one_direct(const std::string& file, const PlayParams& p,
         const uint32_t srcRate = src.rate;
         const uint32_t carrier = srcRate / 16u;
         const int      ch = src.channels;
-        const size_t   totalFrames = (size_t)(src.bits / 16ull);   // DoP 帧数（每声道）
+        const size_t   totalFrames = (size_t)((src.bits + 15ull) / 16ull);   // DoP 帧数（每声道）
         if (totalFrames == 0) {
             std::lock_guard<std::mutex> lk(ps.mtx);
             ps.error = "DSD 数据不足一个 DoP 帧（16 位）";
@@ -1583,6 +1624,7 @@ static bool play_one_direct(const std::string& file, const PlayParams& p,
             ps.error = "打开输出后端失败: " + sink->last_error();
             return false;
         }
+        sink->set_dop_mode(true);
         if (!sink->start()) {
             std::lock_guard<std::mutex> lk(ps.mtx);
             ps.error = "启动输出失败: " + sink->last_error();
@@ -1593,7 +1635,8 @@ static bool play_one_direct(const std::string& file, const PlayParams& p,
         const size_t period = sink->buffer_frames() ? sink->buffer_frames() : 4096;
         std::vector<int32_t> pend;
         size_t pendFrames = 0, posFrames = frameBase, played = 0;
-        bool pausedNow = false, eos = false;
+        bool pausedNow = false, eos = false, padded = false;
+        size_t deviceWritten = 0;
         int  timeouts = 0;
         auto lastLog = std::chrono::steady_clock::now();
         rta::dsp::DopPackState packSt;      // 标记相位跨块保持；跳转时也不重置（避免出现 A,A）
@@ -1606,10 +1649,16 @@ static bool play_one_direct(const std::string& file, const PlayParams& p,
             chunk.rate = srcRate;
             chunk.channels = ch;
             chunk.bits = (uint64_t)n * 16ull;
-            chunk.data.resize((size_t)ch);
-            for (int c = 0; c < ch; ++c)
-                chunk.data[(size_t)c].assign(src.data[(size_t)c].begin() + (long long)(posFrames * 2),
-                                             src.data[(size_t)c].begin() + (long long)((posFrames + n) * 2));
+            chunk.data.assign((size_t)ch, std::vector<uint8_t>(n * 2, 0x69));
+            for (int c = 0; c < ch; ++c) {
+                const size_t firstByte = posFrames * 2;
+                const size_t bytes = std::min(n * 2, src.data[(size_t)c].size() - firstByte);
+                std::copy_n(src.data[(size_t)c].begin() + (ptrdiff_t)firstByte, bytes, chunk.data[(size_t)c].begin());
+                const uint64_t valid = std::min<uint64_t>(n * 16ull, src.bits - posFrames * 16ull);
+                // DsdStream internal storage is MSB first; never expose container padding as source bits.
+                for (uint64_t bit = valid; bit < n * 16ull; ++bit)
+                    chunk.setBit((size_t)c, bit, ((0x69u >> (7u - bit % 8u)) & 1u) != 0);
+            }
             std::vector<int32_t> packed;
             rta::dsp::dsd_to_dop(chunk, packed, packSt);
             pend.insert(pend.end(), packed.begin(), packed.end());
@@ -1644,7 +1693,7 @@ static bool play_one_direct(const std::string& file, const PlayParams& p,
                 // CUE 分轨：seek 比例是**区间内**的（0 = 本轨开头）⟹ 先算区间内偏移再加 frameBase
                 const size_t rel = std::min(frameCount, (size_t)(sk * (double)frameCount + 0.5));
                 posFrames = frameBase + rel;
-                pend.clear(); pendFrames = 0; eos = false; timeouts = 0;
+                pend.clear(); pendFrames = 0; eos = false; padded = false; timeouts = 0;
                 played = rel;
                 ps.played.store(played);
                 continue;
@@ -1654,8 +1703,11 @@ static bool play_one_direct(const std::string& file, const PlayParams& p,
                 if (!append(period)) { eos = true; break; }
                 if (posFrames >= frameEnd) { eos = true; break; }
             }
-            if (eos && pendFrames > 0 && pendFrames < period)
-                append_silence(period - pendFrames);
+            if (eos && !padded && pendFrames > 0) {
+                const size_t remainder = (deviceWritten + pendFrames) % period;
+                if (remainder) append_silence(period - remainder);
+                padded = true;
+            }
             if (pendFrames == 0) {
                 if (eos) break;
                 sink->wait_event(20);
@@ -1686,11 +1738,19 @@ static bool play_one_direct(const std::string& file, const PlayParams& p,
                 }
             }
             sink->wait_event(20);
+            for (size_t frame = 0; frame < pendFrames; ++frame) for (int c = 0; c < ch; ++c) {
+                const size_t index = frame * (size_t)ch + (size_t)c;
+                uint32_t word = (uint32_t)pend[index] & 0xffffu;
+                word |= (((deviceWritten + frame) & 1u) ? 0xfau : 0x05u) << 16;
+                if (word & 0x800000u) word |= 0xff000000u;
+                pend[index] = (int32_t)word;
+            }
             const size_t w = sink->write_available(pend.data(), pendFrames);
             if (w > 0) {
                 pend.erase(pend.begin(), pend.begin() + (long long)(w * (size_t)ch));
                 pendFrames -= w;
-                played += w;
+                deviceWritten += w;
+                played = std::min(frameCount, played + w);
                 ps.played.store(played);
                 timeouts = 0;
             } else if (pendFrames >= period) {
@@ -2620,7 +2680,7 @@ static rta::engine::SourceInfo preset_source_info(const std::map<std::string, st
         std::lock_guard<std::mutex> lk(g_ps.mtx);
         file = g_ps.current;
     }
-    if (file.empty()) file = g_params.file;
+    if (file.empty()) file = params_snapshot().file;
     if (!file.empty()) {
         const std::string ext = rta::audio::lowerExt(file);
         if (ext == ".dsf" || ext == ".dff") {
@@ -3641,18 +3701,12 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
         if (!fname.empty()) {
             const auto* fp = rta::dsp::find_preset(fname, in.rate >= 88200);
             if (fp) {
-                cfg.taps = fp->taps; cfg.transition = fp->transition; cfg.attenDb = fp->attenDb;
-                cfg.filterWindow = fp->window; cfg.filterPhase = fp->phase;
-                cfg.twoStage = fp->twoStage;
-                // 2026-10-25（音质线）：每相位抽头地板 —— 新预设（*-tight）靠它把「每相位抽头数 T」与
-                // 插值因子 L 解耦；否则 44.1→384k（L=1280）时 4095 抽头的预设只剩 4 抽头/相位
-                // （20 kHz 掉 5 dB、THD+N 只剩 -29 dBFS）。既有预设 tapsPerInput=0，逐位不变。
-                cfg.minTapsPerInput = fp->tapsPerInput;
-                if (fp->twoStage && fp->stage2Taps > 0) cfg.stage2Taps = fp->stage2Taps;
+                eng::apply_filter_preset(cfg, *fp);
             }
         }
 
         // ---- 手动覆盖（设置页里可以逐项调，不再受预设限制）----
+        if (p.twoStageExplicit) cfg.twoStage = p.twoStage;
         if (p.taps > 0)       cfg.taps = std::max(1024, p.taps);
         if (p.atten > 0.0)    cfg.attenDb = std::min(300.0, std::max(60.0, p.atten));
         if (p.transition > 0.0) cfg.transition = std::min(0.45, std::max(0.005, p.transition));
@@ -3774,11 +3828,12 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
         const int      outBits  = cfg.outBits ? cfg.outBits : 24;   // 跟随设置里的输出位深
         // 2026-10-24（261024-02 #8）：bit-perfect 的"位深降低"必须用**源文件真实位深**（p.srcBits，由界面从
         // 元数据带下来）。解码器容器位深（flac 恒为 32）会把 16bit 源 → 24bit 输出误判成"位深降低"。
-        const int srcBitsEff = p.srcBits > 0 ? p.srcBits
-                              : ((in.bits > 0 && in.bits <= 24) ? in.bits : 0);
+        const MediaInfo mi = probe_media(file);
+        const int srcBitsEff = mi.bits > 0 ? mi.bits : (p.srcBits > 0 ? p.srcBits
+                              : ((in.bits > 0 && in.bits <= 24) ? in.bits : 0));
         // ★ CUE 分轨：总长按**本区间**（srcCount）算，不是整轨 —— 否则 /api/status 的 dur 与
         //   进度条都会是"整轨"的（实测会看到 dur=10s 而实际只播 4s）。
-        const size_t   totalOut = (size_t)((double)srcCount * (double)deviceRate / (double)in.rate + 0.5);
+        const size_t   totalOut = (size_t)std::ceil((double)srcCount * (double)deviceRate / (double)in.rate);
         ps.outRate = deviceRate; ps.outBits = outBits;
         ps.total.store(totalOut);
 
@@ -3798,7 +3853,6 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
 
         // 信号链快照：源文件 -> 解码 -> 重采样 -> 抖动 -> 音量 -> 设备
         {
-            const MediaInfo mi = probe_media(file);
             // HF-02：device/deviceId 反映【实际使用的端点】（含回退默认端点后的真实身份），
             // 不再无条件下写成默认设备 —— 1.log 那种"只有友好名没有 id"的日志无法区分端点失效。
             // DSD 源抽取设置（P0-5）：信号链里如实写出来，便于核对"选的是不是真生效"
@@ -3903,38 +3957,7 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
                 // 三态：direct（DirectSDM 1-bit 直通，最严格）/ yes / no（附原因）
                 // 口径：①不重采样 ②音量 0 dB ③无抖动/整形 ④无衰减 ⑤无 EQ/IR ⑥非 DoP ⑦位深未降
                 // 2026-10-24（261024-02 #8）：位深判据用"源文件真实位深"（见下方 srcBitsEff 声明）
-                << ",\"bitPerfect\":\"" << ([&] {
-                       if (p.directSdm && directNote.empty()) return std::string("direct");
-                       if (outRate != in.rate) return std::string("no");
-                       if (cfg.volumeEnabled && std::fabs(cfg.volumeDb) > 1e-9) return std::string("no");
-                       if (cfg.shaper != rta::dsp::Shaper::None) return std::string("no");
-                       if (std::fabs(cfg.replayGainDb) > 1e-9) return std::string("no");   // RG 改样本值
-                       // 2026-10-24（261024-02 #8）：attenDb 是**滤波器阻带衰减设计值**（如 120 dB），
-                       // 不是信号增益！以前拿它判"衰减"⟹ 只要选了滤波器预设就永远非 bit-perfect（误报）。
-                       // 真正的信号衰减是 preAttenDb（ISP/调制器余量预衰减）。
-                       if (cfg.preAttenDb > 1e-9) return std::string("no");
-                       if (eqLoaded || convLoaded || rcAuto.applied || dop) return std::string("no");
-                       if (srcBitsEff > 0 && outBits > 0 && outBits < srcBitsEff) return std::string("no");
-                       return std::string("yes");
-                   }()) << "\""
-                << ",\"bitPerfectWhy\":\"" << jesc([&] {
-                       if (p.directSdm && directNote.empty()) return std::string("DirectSDM：1-bit 直通，跳过 PCM 与调制");
-                       std::vector<std::string> why;
-                       if (outRate != in.rate) why.push_back("重采样 " + std::to_string(in.rate) + "→" + std::to_string(outRate) + " Hz");
-                       if (cfg.volumeEnabled && std::fabs(cfg.volumeDb) > 1e-9) why.push_back("音量 " + std::to_string((int)std::lround(cfg.volumeDb)) + " dB");
-                       if (cfg.shaper != rta::dsp::Shaper::None) why.push_back("抖动/整形");
-                       if (std::fabs(cfg.replayGainDb) > 1e-9)
-                           why.push_back("ReplayGain " + std::to_string((int)std::lround(cfg.replayGainDb)) + " dB");
-                       if (cfg.preAttenDb > 1e-9) why.push_back("预衰减");
-                       if (eqLoaded) why.push_back("EQ");
-                       if (convLoaded) why.push_back("IR 卷积");
-                       if (rcAuto.applied) why.push_back("房间校正（" + rcAuto.file + "）");
-                       if (dop) why.push_back("DoP 载波");
-                       if (srcBitsEff > 0 && outBits > 0 && outBits < srcBitsEff) why.push_back("位深降低");
-                       if (why.empty()) return std::string("源→解码→输出全程逐位一致");
-                       std::string s; for (size_t i = 0; i < why.size(); ++i) { if (i) s += "、"; s += why[i]; }
-                       return s;
-                   }()) << "\""
+                << ",\"bitPerfect\":\"unknown\",\"bitPerfectWhy\":\"等待实际输出样本\""
                 << ",\"decodeMs\":" << note.totalMs
                 << ",\"ffmpegMs\":" << note.ffmpegMs
                 << ",\"wavReadMs\":" << note.wavReadMs
@@ -3942,28 +3965,9 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
                 << "}";
             recent_add(file, mi.title.empty() ? stem_or_self(file) : mi.title,
                        mi.artist, mi.album);
-            // 把结论写进 ps 供 /api/status 带出（用同一个判定，避免两处口径漂移）
-            {
-                std::string bps = "no", bpw = "见信号链";
-                if (p.directSdm && directNote.empty()) { bps = "direct"; bpw = "DirectSDM：1-bit 直通，跳过 PCM 与调制"; }
-                else {
-                    std::vector<std::string> why;
-                    if (outRate != in.rate) why.push_back("重采样 " + std::to_string(in.rate) + "→" + std::to_string(outRate) + " Hz");
-                    if (cfg.volumeEnabled && std::fabs(cfg.volumeDb) > 1e-9) why.push_back("音量 " + std::to_string((int)std::lround(cfg.volumeDb)) + " dB");
-                    if (cfg.shaper != rta::dsp::Shaper::None) why.push_back("抖动/整形");
-                    if (std::fabs(cfg.replayGainDb) > 1e-9)
-                        why.push_back("ReplayGain " + std::to_string((int)std::lround(cfg.replayGainDb)) + " dB");
-                    if (cfg.preAttenDb > 1e-9) why.push_back("预衰减");   // 见上方口径注：attenDb 是滤波设计值
-                    if (eqLoaded) why.push_back("EQ");
-                    if (convLoaded) why.push_back("IR 卷积");
-                    if (rcAuto.applied) why.push_back("房间校正（" + rcAuto.file + "）");
-                    if (dop) why.push_back("DoP 载波");
-                    if (srcBitsEff > 0 && outBits > 0 && outBits < srcBitsEff) why.push_back("位深降低");
-                    if (why.empty()) { bps = "yes"; bpw = "源→解码→输出全程逐位一致"; }
-                    else { std::string s; for (size_t i = 0; i < why.size(); ++i) { if (i) s += "、"; s += why[i]; } bpw = s; }
-                }
-                std::lock_guard<std::mutex> lk(ps.mtx);
-                ps.bpState = bps; ps.bpWhy = bpw;
+            { std::lock_guard<std::mutex> lk(ps.mtx);
+              ps.pipelineIntegrity = {"unknown", "等待实际输出样本"};
+              ps.bpState = "unknown"; ps.bpWhy = "等待实际输出样本";
             }
             dlog("stage recent-ok");
             play_log(std::string("PLAY v") + RLPLAYER_VERSION + " " + sig.str());
@@ -3990,6 +3994,7 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
         ps.volDb.store(p.volume);
 
         std::thread prod([&]() {
+            try {
             const size_t kChunk = 4096;
             uint64_t myEpoch = RQ.epoch.load();
             auto pl = std::make_unique<eng::Pipeline>(cfg);
@@ -4010,6 +4015,8 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
                 rta::dsp::SdmConfig mcfg;
                 mcfg.fs = (double)dsdRate;
                 mcfg.family = rta::dsp::parse_modulator_family(p.modFamily);
+                mcfg.ahmBits = p.ahmBits;
+                mcfg.oobGainDb = p.oobGain;
                 mcfg.levels = 2;                 // 1-bit (DoP)
                 mcfg.order = rta::dsp::stable_sdm_order(p.modOrder > 0 ? p.modOrder : 5, mcfg.fs, mcfg.levels, mcfg.family);
                 // 生效阶数如实上报（261025-02 #5）：用户填 7 阶、stable_sdm_order 按位率/族下调时，
@@ -4024,10 +4031,15 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
                 for (int c = 0; c < outCh; ++c) mods.push_back(std::make_unique<rta::dsp::SdmModulator>(mcfg));
                 carry.assign((size_t)outCh, {});
             }
-            try {
+            bool drained = false;
                 for (;;) {
                     if (RQ.abort.load()) break;
-                    const long long sf = RQ.seekFrame.exchange(-1);
+                    long long sf;
+                    uint64_t seekEpoch;
+                    { std::lock_guard<std::mutex> lk(RQ.mtx);
+                      sf = RQ.seekFrame.exchange(-1);
+                      seekEpoch = RQ.epoch.load();
+                    }
                     if (sf >= 0) {
                         // sf 是区间内的帧号（0 = 本轨开头）⟹ 先夹到 srcCount，再加 srcBase
                         size_t rel = (size_t)sf;
@@ -4038,24 +4050,39 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
                         skipOut = (size_t)((double)preroll * (double)outRate / (double)in.rate + 0.5);
                         // 清空滤波历史（不是重建管线：重建要重新设计 26 万抽头滤波器，秒级卡顿）
                         pl->seek_reset();
+                        drained = false;
+                        for (auto& mod : mods) mod->reset();
+                        for (auto& pending : carry) pending.clear();
 
-                        { std::lock_guard<std::mutex> lk(RQ.mtx); RQ.q.clear(); }
-                        myEpoch = RQ.epoch.load();
+                        myEpoch = seekEpoch; // target and generation were claimed atomically
+                        { std::lock_guard<std::mutex> lk(RQ.mtx);
+                          if (myEpoch == RQ.epoch.load()) { RQ.q.clear(); RQ.done = false; }
+                        }
                         RQ.cv.notify_all();
                     }
-                    if (pos >= segEnd) break;
-                    const size_t n = std::min(kChunk, segEnd - pos);
+                    if (pos >= segEnd && drained) {
+                        std::unique_lock<std::mutex> lk(RQ.mtx);
+                        if (myEpoch == RQ.epoch.load() && RQ.seekFrame.load() < 0) RQ.done = true;
+                        RQ.cv.notify_all();
+                        // EOF ends this generation, not the producer's ability to seek while queued audio plays.
+                        RQ.cv.wait(lk, [&] { return RQ.abort.load() || RQ.seekFrame.load() >= 0; });
+                        continue;
+                    }
                     AudioBuffer c;
-                    // ★ 流式：向源要这一块（整曲路径下与旧代码逐字节相同）
-                    const size_t gotFrames = src.read(pos, n, c);
-                    pos += gotFrames;
-                    if (gotFrames == 0) break;
+                    if (pos < segEnd) {
+                        const size_t n = std::min(kChunk, segEnd - pos);
+                        const size_t gotFrames = src.read(pos, n, c);
+                        if (gotFrames == 0) throw std::runtime_error("Audio source ended before its declared length");
+                        pos += gotFrames;
+                    }
                     const auto t_dsp_0 = std::chrono::steady_clock::now();
                     // 2026-10-24（用户 261024-04 #8）：把 PipelineStats 收下来，才能回答
                     // 「本次卷积到底走没走 GPU」—— 旧代码传 nullptr，这个事实被直接丢掉，
                     // 于是 /api/signal 的 irGpu 只能是"用户勾了开关"（设置项），不是实测。
                     eng::PipelineStats pst;
-                    AudioBuffer o = pl->process(c, &pst);
+                    AudioBuffer o;
+                    if (c.frames()) o = pl->process(c, &pst);
+                    else { o = pl->finish(&pst); drained = true; }
                     if (blocksDone++ == 0) {
                         // 首块成本 = 重采样器设计（26 万抽头）+ 一块 DSP。这是"起播延迟"里
                         // 除解码/扫描之外的第三项，必须能单独量出来（2026-10-25 大文件卡死取证）。
@@ -4065,6 +4092,15 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
                         play_log(mem_line("dsp-first-block", b));
                     }
                     if (pst.usedGpuConvolution) ps.gpuConvUsed.store(true);
+                    if (pst.outFrames) {
+                        const auto result = eng::playback_integrity(pst,
+                            eng::IntegritySource{srcBitsEff, in.bits, in.channels, in.isFloat},
+                            eng::IntegrityOutput{dop ? "dop" : "pcm", false, 0});
+                        std::lock_guard<std::mutex> lk(ps.mtx);
+                        // The badge describes this playback session: a processed prefix cannot become bit-perfect later.
+                        if (ps.pipelineIntegrity.state != "no" || result.state == "no") ps.pipelineIntegrity = result;
+                        publish_integrity_locked(ps);
+                    }
                     // 2026-10-26（261026-07）：无条件按实测同步，不再"只升不降"。
                     // gpuResampleActive() = 重采样器本次是否真的跑在 GPU 上；
                     // 不升频时管线根本不进阶段 5（pipeline.h:366 的 outRate != in.rate 守卫），
@@ -4072,18 +4108,25 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
                     RQ.gpu.store(pl->gpuResampleActive());
                     if (skipOut > 0 && !o.raw.empty()) {
                         const size_t d = std::min(skipOut, o.frames());
+                        // Warm the new epoch's modulator with discarded preroll as well as the PCM filters.
+                        if (dop) for (int ch = 0; ch < outCh; ++ch)
+                            for (size_t i = 0; i < d; ++i) mods[(size_t)ch]->process_dsd(o.sample(i, ch));
                         o.raw.erase(o.raw.begin(), o.raw.begin() + (long long)(d * (size_t)o.channels));
                         skipOut -= d;
                     }
                     // ---- DSD：PCM(DSD 速率) -> 1-bit -> DoP 24-bit 载波 ----
-                    if (dop && !o.raw.empty()) {
+                    if (dop && (!o.raw.empty() || (drained && !carry.empty() && !carry[0].empty()))) {
                         const size_t n = o.frames();
                         std::vector<std::vector<double>> sd((size_t)outCh);
                         for (int c = 0; c < outCh; ++c) {
                             auto& v = sd[(size_t)c];
                             v = carry[(size_t)c];                    // 接着上一块的残余
                             v.reserve(v.size() + n);
-                            for (size_t i = 0; i < n; ++i) v.push_back(mods[(size_t)c]->process(o.sample(i, c)));
+                            for (size_t i = 0; i < n; ++i) v.push_back(mods[(size_t)c]->process_dsd(o.sample(i, c)));
+                        }
+                        if (drained) {
+                            // Preserve the final source bits; pad only the incomplete 16-bit carrier frame.
+                            for (auto& bits : sd) while (bits.size() % 16) bits.push_back(bits.size() % 2 ? -1.0 : 1.0);
                         }
                         const size_t total = sd[0].size();
                         const size_t use = (total / 16) * 16;        // 只打包整数个 DoP 帧
@@ -4130,6 +4173,8 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
             RQ.cv.wait_for(lk, std::chrono::seconds(15),
                            [&] { return !RQ.q.empty() || RQ.done || RQ.abort.load(); });
             if (RQ.q.empty()) {
+                // The producer takes RQ.mtx to publish failure/done before it exits.
+                lk.unlock();
                 RQ.abort.store(true); RQ.cv.notify_all(); prod.join();
                 // 归因（本轮补）：首块 15 秒未产出发生在【输出设备打开之前】，
                 // 与音频设备无关 —— 解码、滤波器设计（大抽头数）、CPU 过载都会导致。
@@ -4172,6 +4217,7 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
         if (auto* w = dynamic_cast<WasapiSink*>(sink.get())) {
             if (!w->fmt_note().empty()) appendNote(w->fmt_note());
         }
+        sink->set_dop_mode(dop);
         if (!sink->start()) {
             RQ.abort.store(true); RQ.cv.notify_all(); prod.join();
             std::lock_guard<std::mutex> lk(ps.mtx);
@@ -4200,6 +4246,7 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
         rl.stop = &ps.stop; rl.pauseReq = &ps.pauseReq; rl.paused = &ps.paused;
         rl.seekReq = &ps.seekReq; rl.played = &ps.played;
         rl.volDb = &ps.volDb; rl.startDb = &ps.startDb; rl.dbgPad = &ps.dbgPad; rl.gpuOut = &ps.gpu;
+        rl.gpuMutex = &ps.mtx;
         rl.rq = &RQ;
         rl.deviceRate = deviceRate; rl.outBits = outBits; rl.outCh = outCh;
         // inFrames/totalOut 必须是**本区间**的：render_loop 的 seek 用 inFrames 算 seekFrame，
@@ -7035,19 +7082,21 @@ static bool peq_parse_bands_param(const std::string& val, std::vector<rta::dsp::
     std::string item;
     while (std::getline(is, item, ';')) {
         if (item.empty()) continue;
+        std::vector<std::string> fields;
+        std::istringstream parts(item); std::string field;
+        while (std::getline(parts, field, ',')) fields.push_back(field);
+        if (fields.size() < 5 || fields.size() > 6) return false;
+        (void)rta::net::request_integer(fields[0], "band index");
+        const double f = rta::net::request_number(fields[2], "band frequency");
+        const double g = rta::net::request_number(fields[3], "band gain");
+        const double q = rta::net::request_number(fields[4], "band Q");
         rta::dsp::PeqBand b;
-        char type[8] = {0};
-        double f = 1000.0, g = 0.0, q = 1.41;
-        char tail[16] = {0};
-        const int n = std::sscanf(item.c_str(), "%*d,%7[^,],%lf,%lf,%lf,%15s", type, &f, &g, &q, tail);
-        if (n < 4) return false;
-        rta::dsp::PeqBandType t;
-        if (!rta::dsp::peq_band_type_from_name(type, t)) t = rta::dsp::PeqBandType::Peak;
-        b.type = t;
-        b.freq = std::min(std::max(f, 10.0), 20000.0);
-        b.gainDb = std::min(std::max(g, -24.0), 24.0);
-        b.q = std::min(std::max(q, 0.1), 20.0);
-        b.enabled = !(std::string(tail).find("off") != std::string::npos);
+        if (!rta::dsp::peq_band_type_from_name(fields[1], b.type)) return false;
+        b.freq = std::clamp(f, 10.0, 20000.0);
+        b.gainDb = std::clamp(g, -24.0, 24.0);
+        b.q = std::clamp(q, 0.1, 20.0);
+        if (fields.size() == 6 && fields[5] != "off" && fields[5] != "on") return false;
+        b.enabled = fields.size() == 5 || fields[5] != "off";
         out.push_back(b);
     }
     return !out.empty();
@@ -8332,7 +8381,7 @@ struct PreSlot {
 };
 static PreSlot g_pre;
 
-static void prefetch_start(const std::string& path) {
+static void prefetch_start(const std::string& path, const PlayParams& params) {
     if (path.empty() || g_pre.busy.load()) return;
     // 大文件不预解码（2026-10-25）：这类文件在播放时走流式，预先把整曲塞进内存正好是
     // 要修的那个病（517 MB + 1 GB 峰值）。判据与播放路径同一个函数，不会出现两套口径。
@@ -8349,11 +8398,10 @@ static void prefetch_start(const std::string& path) {
         if (g_pre.path == path && !g_pre.buf.raw.empty()) return;   // 已有现成的
     }
     g_pre.busy.store(true);
-    g_pre.path = path;
-    { std::lock_guard<std::mutex> lk(g_pre.mtx); g_pre.buf = AudioBuffer{}; }
-    g_pre.th = std::thread([path]() {
+    { std::lock_guard<std::mutex> lk(g_pre.mtx); g_pre.path = path; g_pre.buf = AudioBuffer{}; }
+    g_pre.th = std::thread([path, params]() {
         try {
-            apply_dsd_src_settings(g_params);      // 预解码也按当前设置（否则会解码出另一套滤波器）
+            apply_dsd_src_settings(params);      // 预解码也按当前设置（否则会解码出另一套滤波器）
             AudioBuffer b = read_any(path, nullptr);
             std::lock_guard<std::mutex> lk(g_pre.mtx);
             if (g_pre.path == path) g_pre.buf = std::move(b);
@@ -8415,7 +8463,7 @@ static void queue_thread(PlayParams p, size_t start) {
         ps.played.store(0);
         ps.total.store(0);
 
-        if (!nextPath.empty()) prefetch_start(nextPath);   // 后台预解码下一曲
+        if (!nextPath.empty()) prefetch_start(nextPath, p);   // 后台预解码下一曲
 
         AudioBuffer buf = prefetch_take(cur.path);
         // ★ 本曲的播放区间**只来自队列项**：绝不沿用上一曲的 cueStart/cueEnd。
@@ -9563,12 +9611,27 @@ static bool roomcorr_start(RoomCorrRequest req) {
 static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct);
 static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
     try {
+        static const char* commands[] = {"/api/play", "/api/lib/play", "/api/sq/play", "/api/skip",
+            "/api/stop", "/api/clear", "/api/cast/start", "/api/cast/stop", "/api/quit", "/api/shutdown",
+            "/api/volume", "/api/seek", "/api/pause", "/api/queue/set", "/api/lib/enqueue",
+            "/api/add", "/api/qdel", "/api/qmove", "/api/qsort", "/api/qorder", "/api/playmode", "/api/shuffle", "/api/repeat"};
+        std::unique_lock<std::mutex> command(g_commandMx, std::defer_lock);
+        for (const auto* path : commands) if (rta::net::route_matches(rq.path, path)) { command.lock(); break; }
+        if (command.owns_lock() && g_exitReq.load()) {
+            rta::net::webui_set_status(503); ct = "application/json; charset=utf-8";
+            return "{\"ok\":false,\"error\":\"Player is shutting down\"}";
+        }
         return handle_impl(rq, ct);
+    } catch (const rta::net::InvalidRequest& e) {
+        rta::net::webui_set_status(400); ct = "application/json; charset=utf-8";
+        return std::string("{\"ok\":false,\"error\":\"") + jesc(e.what()) + "\"}";
     } catch (const std::exception& e) {
+        rta::net::webui_set_status(500);
         play_log(std::string("WARN handler 异常 ") + rq.path + " : " + e.what());
         ct = "application/json; charset=utf-8";
         return std::string("{\"ok\":false,\"error\":\"内部错误: ") + jesc(std::string(e.what())) + "\"}";
     } catch (...) {
+        rta::net::webui_set_status(500);
         play_log(std::string("WARN handler 未知异常 ") + rq.path);
         ct = "application/json; charset=utf-8";
         return "{\"ok\":false,\"error\":\"内部错误(unknown)\"}";
@@ -9593,7 +9656,7 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
 // ---------------------------------------------------------------------------
 static bool is_side_effect_path(const std::string& p) {
     static const char* kNeedPost[] = {
-        "/api/play", "/api/pause", "/api/stop", "/api/seek", "/api/skip", "/api/volume",
+        "/api/lib/play", "/api/lib/enqueue", "/api/play", "/api/pause", "/api/stop", "/api/seek", "/api/skip", "/api/volume",
         "/api/clear", "/api/repeat", "/api/shuffle", "/api/add", "/api/qdel", "/api/qmove",
         "/api/fav", "/api/pl", "/api/lib/scan", "/api/lib/prune", "/api/lib/remove",
         "/api/lib/roots", "/api/rescan", "/api/quit", "/api/shutdown", "/api/settings",
@@ -9629,14 +9692,8 @@ static bool is_side_effect_path(const std::string& p) {
         // 只读端点是 /api/update/check、/api/update/progress、/api/update/state（不进这张表）。
         "/api/update/download", "/api/update/apply", "/api/update/skip",
     };
-    for (const char* k : kNeedPost) {
-        const size_t n = std::strlen(k);
-        if (p.compare(0, n, k) != 0) continue;
-        // 前缀必须"整段"命中：/api/pause 不能匹配到 /api/pauses
-        if (p.size() == n) return true;
-        const char c = p[n];
-        if (c == '/' || c == '?' || c == '&') return true;
-    }
+    for (const char* k : kNeedPost)
+        if (rta::net::route_matches(p, k, true)) return true;
     return false;
 }
 
@@ -9662,7 +9719,7 @@ static bool is_side_effect_exempt(const std::string& p) {
     // 同理：/api/lib/cover/apiFill 也会联网 + 落盘（一个 <img src> 就能让整库去问 LLM，最贵的那种）。
     if (p.rfind("/api/lib/cover/apiFill", 0) == 0) return false;
     if (p.rfind("/api/lib/cover/apifill", 0) == 0) return false;
-    for (const char* k : kGetOk) if (p.rfind(k, 0) == 0) return true;
+    for (const char* k : kGetOk) if (rta::net::route_matches(p, k)) return true;
     return false;
 }
 
@@ -9687,9 +9744,9 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     };
     auto getReadOnlyOk = [&](const std::string& p) {
         if (hasSideEffectQuery(p)) return false;
-        if (p.rfind("/api/writeback", 0) == 0) return p.rfind("/api/writeback/status", 0) != 0;  // 预览端点
-        if (p.rfind("/api/settings", 0) == 0) return true;
-        if (p.rfind("/api/peq", 0) == 0) return p.rfind("/api/peq/preset", 0) != 0;
+        if (rta::net::route_matches(p, "/api/writeback")) return true;  // 预览端点
+        if (rta::net::route_matches(p, "/api/settings")) return true;
+        if (rta::net::route_matches(p, "/api/peq")) return true;
         return false;
     };
     // 注意：/api/fav 既要有 GET 列表（/api/fav/list）又要有 POST 切换，所以先判豁免。
@@ -9721,7 +9778,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     // ---------------- 房间校正 API（2026-10-26）----------------
     // 只读：layouts / status / download（GET 白名单，不进 kNeedPost）
     // 副作用：measure / cancel（已进 kNeedPost ⟹ 非 POST 在函数开头就 405 了）
-    if (rq.path.rfind("/api/roomcorr/", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/roomcorr", true)) {
         ct = "application/json; charset=utf-8";
         auto rc_bad = [&](int code, const std::string& msg) {
             rta::net::webui_set_status(code);
@@ -9729,7 +9786,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         };
 
         // ---- GET /api/roomcorr/layouts ----
-        if (rq.path.rfind("/api/roomcorr/layouts", 0) == 0) {
+        if (rta::net::route_matches(rq.path, "/api/roomcorr/layouts")) {
             std::ostringstream j;
             j << "{\"ok\":true,\"layouts\":[";
             bool first = true;
@@ -9752,7 +9809,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         }
 
         // ---- GET /api/roomcorr/status ----
-        if (rq.path.rfind("/api/roomcorr/status", 0) == 0) {
+        if (rta::net::route_matches(rq.path, "/api/roomcorr/status")) {
             std::lock_guard<std::mutex> lk(g_roomcorr.mtx);
             roomcorr_probe_disk_locked();
             std::ostringstream j;
@@ -9783,7 +9840,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         }
 
         // ---- GET /api/roomcorr/download?layout=<名> ----
-        if (rq.path.rfind("/api/roomcorr/download", 0) == 0) {
+        if (rta::net::route_matches(rq.path, "/api/roomcorr/download")) {
             auto ps = roomcorr_params(rq);
             const std::string name = ps.count("layout") ? ps["layout"] : "";
             if (!roomcorr_find_layout(name))
@@ -9795,7 +9852,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         }
 
         // ---- POST /api/roomcorr/measure ----
-        if (rq.path.rfind("/api/roomcorr/measure", 0) == 0) {
+        if (rta::net::route_matches(rq.path, "/api/roomcorr/measure")) {
             auto ps = roomcorr_params(rq);
             // 铁律 1：缺 confirm=1 一律拒绝，且**什么都不做**（不开设备、不建线程）
             const auto itc = ps.find("confirm");
@@ -9887,7 +9944,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         }
 
         // ---- POST /api/roomcorr/cancel ----
-        if (rq.path.rfind("/api/roomcorr/cancel", 0) == 0) {
+        if (rta::net::route_matches(rq.path, "/api/roomcorr/cancel")) {
             const bool wasRunning = g_roomcorr.running.load();
             g_roomcorr.cancelled.store(true);   // 协作式：只置标志，由会话/传输自己收尾（铁律 2）
             play_log(std::string("ROOMCORR cancel requested running=") + (wasRunning ? "1" : "0"));
@@ -9898,7 +9955,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         return rc_bad(404, "未知的 /api/roomcorr 端点");
     }
 
-    if (rq.path.rfind("/api/files", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/files")) {
         ct = "application/json; charset=utf-8";
         // 默认位置：音乐库的第一个根目录（而不是磁盘根 —— 那样打开就是空的）
         std::string dir;
@@ -9949,7 +10006,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     // GET /api/artist/image?name=<艺人名> → 头像字节（image/jpeg）；没有就 404 + {}。
     // 绝不回退到专辑封面（用户 2026-10-25 钦定：「不许再用专辑封面顶替，取不到就留空」）。
     // 位置要求：必须挂在 /api 顶层分支（不能塞进 /api/lib 块里 —— 前缀恰好不冲突也会在重构时静默丢失）。
-    if (rq.path.rfind("/api/artist/image", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/artist/image")) {
         // 2026-10-27（261027-03 #7 真根因）：**先按 '&' 切参数，再 urlDecode**。
         // 旧写法是把 ?name= 之后到行尾整段 urlDecode 进 name ⟹ 前端只要带缓存击穿参数
         // （artistImgUrl(name, round) 的 "&r=<round>"，用于绕过 Chromium 对 404 的负缓存），
@@ -9988,7 +10045,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     //   body: names=<名字\n或|分隔>（可选；不给则用库里的艺术家）
     //   返回 {"ok":true,"queued":N,"running":true} ；上一轮还没跑完 ⟹ running=false, queued=0（不排队）。
     //   ★ 名字列表必须**在进入后台之前**就拷好：后台线程绝不回头碰 Library 单例。
-    if (rq.path.rfind("/api/artist/prefetch", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/artist/prefetch")) {
         ct = "application/json; charset=utf-8";
         std::string raw;
         {
@@ -10058,7 +10115,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     //   进度并入 /api/lib/cover/progress 的 artistApiDone / artistApiHit 等字段。
     //   ★ 为什么也走 LLM：艺术家页大量空白的根因是**同人社团/独立艺人根本不在网易库里**
     //     （用户 2026-10-26：「艺术家页大量空白/仍是专辑封面」）；脚本那条路已经确认无结果（.none）。
-    if (rq.path.rfind("/api/artist/apifill", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/artist/apifill")) {
         ct = "application/json; charset=utf-8";
         std::string raw;
         {
@@ -10102,7 +10159,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
 
     // ---------------- 本地音乐库（专辑 / 艺术家 / 搜索）----------------
     // 设计取向参考 Roon：以「专辑」为一等公民，而不是让用户翻目录树。
-    if (rq.path.rfind("/api/lib", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/lib", true)) {
         ct = "application/json; charset=utf-8";
         auto& lib = Library::instance();
 
@@ -10110,7 +10167,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         // 两个端点共用**无锁快照**（Library::snapshot()）：只读原子量 + 一次短锁读进度文本，
         // 绝不触发专辑整理、绝不排队等扫描线程持有的 mtx_。
         // /api/lib/status 是给"轮询进度"用的窄端点；/api/lib/stats 保留原字段（含 roots）。
-        if (rq.path.rfind("/api/lib/status", 0) == 0) {
+        if (rta::net::route_matches(rq.path, "/api/lib/status")) {
             const auto s = lib.snapshot();
             std::ostringstream j;
             j << "{\"ok\":true"
@@ -10126,7 +10183,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
               << ",\"msg\":\"" << jesc(s.msg) << "\"}";
             return j.str();
         }
-        if (rq.path.rfind("/api/lib/stats", 0) == 0) {
+        if (rta::net::route_matches(rq.path, "/api/lib/stats")) {
             std::ostringstream j;
             const auto roots = lib.roots();
             const auto s = lib.snapshot();
@@ -10145,8 +10202,8 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
             j << "]}";
             return j.str();
         }
-        if (rq.path.rfind("/api/lib/scan", 0) == 0 || rq.path.rfind("/api/rescan", 0) == 0) {
-            const bool full = rq.body.find("full=1") != std::string::npos || rq.path.rfind("/api/rescan", 0) == 0;
+        if (rta::net::route_matches(rq.path, "/api/lib/scan") || rta::net::route_matches(rq.path, "/api/rescan")) {
+            const bool full = rq.body.find("full=1") != std::string::npos || rta::net::route_matches(rq.path, "/api/rescan");
             // 扫描触发点只有两处：① 用户点「扫描/重新扫描」② 目录变更（加根后 UI 主动调一次）。
             // 每次都在日志里留一条 LIBSCAN —— 这样"切标签有没有偷偷扫描"是可查证的（判据见
             // tests/verify_scan_261025.ps1 的 S4），而不是靠"我觉得没扫"。
@@ -10159,13 +10216,13 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
             return "{\"ok\":true}";
         }
         // ---- 清理（261025-01 一.3：删掉的文件的记录必须能清掉）----
-        if (rq.path.rfind("/api/lib/prune", 0) == 0) {
+        if (rta::net::route_matches(rq.path, "/api/lib/prune")) {
             const auto r = lib.pruneMissing();
             dlog("LIBSCAN prune removed=" + std::to_string(r.removed) + " tracks=" + std::to_string(r.tracks));
             return "{\"ok\":true,\"removed\":" + std::to_string(r.removed) +
                    ",\"tracks\":" + std::to_string(r.tracks) + "}";
         }
-        if (rq.path.rfind("/api/lib/remove", 0) == 0) {
+        if (rta::net::route_matches(rq.path, "/api/lib/remove")) {
             std::string p;
             const size_t q = rq.path.find("?path=");
             if (q != std::string::npos) p = urlDecode(rq.path.substr(q + 6));
@@ -10187,7 +10244,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
             return "{\"ok\":true,\"removed\":" + std::to_string(r.removed) +
                    ",\"tracks\":" + std::to_string(r.tracks) + "}";
         }
-        if (rq.path.rfind("/api/lib/roots", 0) == 0) {
+        if (rta::net::route_matches(rq.path, "/api/lib/roots")) {
             std::string add, rem;
             std::istringstream is(rq.body);
             std::string tok;
@@ -10207,7 +10264,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
             return "{\"ok\":true}";
         }
         // 注意：/api/lib/albums 必须在 /api/lib/album 之前判断（后者是前者的前缀）
-        if (rq.path.rfind("/api/lib/albums", 0) == 0) {
+        if (rta::net::route_matches(rq.path, "/api/lib/albums")) {
             std::string q;
             const size_t p = rq.path.find("?q=");
             if (p != std::string::npos) q = urlDecode(rq.path.substr(p + 3));
@@ -10248,7 +10305,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
             j << "]}";
             return j.str();
         }
-        if (rq.path.rfind("/api/lib/album", 0) == 0) {
+        if (rta::net::route_matches(rq.path, "/api/lib/album")) {
             std::string key;
             const size_t p = rq.path.find("?k=");
             if (p != std::string::npos) key = urlDecode(rq.path.substr(p + 3));
@@ -10286,7 +10343,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
             j << "]}";
             return j.str();
         }
-        if (rq.path.rfind("/api/lib/search", 0) == 0) {
+        if (rta::net::route_matches(rq.path, "/api/lib/search")) {
             std::string q;
             const size_t p = rq.path.find("?q=");
             if (p != std::string::npos) q = urlDecode(rq.path.substr(p + 3));
@@ -10308,7 +10365,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         }
         // ---- 封面抓取进度（只读；纯原子量，绝不碰 mtx_，更不发网络）----
         // 顺序要求：必须排在下面的 /api/lib/cover 分支之前（否则会被当成"要一张封面"）。
-        if (rq.path.rfind("/api/lib/cover/progress", 0) == 0) {
+        if (rta::net::route_matches(rq.path, "/api/lib/cover/progress")) {
             std::shared_ptr<CoverBg> bg;
             {
                 std::lock_guard<std::mutex> lk(g_cover_bg_mtx);
@@ -10381,7 +10438,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         }
         // ---- 封面预热（POST；副作用端点，见 kNeedPost）----
         // 立刻返回，网络/下载全在后台 2 线程（见文件中部「专辑封面在线抓取」注释）。
-        if (rq.path.rfind("/api/lib/cover/prefetch", 0) == 0) {
+        if (rta::net::route_matches(rq.path, "/api/lib/cover/prefetch")) {
             // 查询参数按名取（旧代码写死 "?k=" ⟹ 一旦加上 all=1 前缀就再也取不到 k）
             auto qp_get = [](const std::string& raw, const char* name) {
                 const std::string pat = std::string(name) + "=";
@@ -10443,7 +10500,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         // 为什么要它：同人自出版专辑在网易/QQ/iTunes 全都查不到、文件里也没有图（实测 17/181），
         // 程序再怎么抓也抓不到 —— 这类只能由用户挑一张图。落盘到 covercache（**不改动音乐文件**）。
         // 契约：POST /api/lib/cover/set?k=<专辑键>，body = 图片原始字节（jpg/png/webp/gif），≤24 MB。
-        if (rq.path.rfind("/api/lib/cover/set", 0) == 0) {
+        if (rta::net::route_matches(rq.path, "/api/lib/cover/set")) {
             std::string key;
             const size_t qp = rq.path.find("?k=");
             if (qp != std::string::npos) key = urlDecode(rq.path.substr(qp + 3));
@@ -10481,8 +10538,8 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         // 可选 k=<键,键>（只补这几张：测试与"补单张"用）；不给 = 全库「库里无图 + 已有 .none」的那批。
         // 契约：**立刻返回**（实测 < 40 ms，零网络），网络全在后台 2 worker（每个 8 s 预算）；
         //      进度见 /api/lib/cover/progress 的 apiDone / apiHit / apiRejected / apiFail。
-        if (rq.path.rfind("/api/lib/cover/apiFill", 0) == 0 ||
-            rq.path.rfind("/api/lib/cover/apifill", 0) == 0) {
+        if (rta::net::route_matches(rq.path, "/api/lib/cover/apiFill") ||
+            rta::net::route_matches(rq.path, "/api/lib/cover/apifill")) {
             std::string rawK;
             const size_t qp = rq.path.find("?k=");
             if (qp != std::string::npos) rawK = urlDecode(rq.path.substr(qp + 3));
@@ -10534,7 +10591,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
               << ",\"ms\":" << mb << "}";
             return j.str();
         }
-        if (rq.path.rfind("/api/lib/cover", 0) == 0) {
+        if (rta::net::route_matches(rq.path, "/api/lib/cover", true)) {
             std::string key;
             const size_t p = rq.path.find("?k=");
             if (p != std::string::npos) key = urlDecode(rq.path.substr(p + 3));
@@ -10607,7 +10664,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
             return std::string(bytes.begin(), bytes.end());
         }
         // 播放整张专辑（?k=专辑键&i=起始曲序），队列被换成这张专辑
-        if (rq.path.rfind("/api/lib/play", 0) == 0) {
+        if (rta::net::route_matches(rq.path, "/api/lib/play")) {
             PlayParams p = parseForm(rq.body);
             std::string key;
             size_t start = 0;
@@ -10651,7 +10708,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
                 g_q.index = start;
             }
             queue_save();
-            g_params = p;
+            params_store(p);
             ps.stop.store(true);
             ps.joinIfDone();
             ps.stop.store(false);
@@ -10663,7 +10720,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
             return "{\"ok\":true,\"count\":" + std::to_string(items.size()) + "}";
         }
         // 整张专辑加入队列（不打断当前播放）
-        if (rq.path.rfind("/api/lib/enqueue", 0) == 0) {
+        if (rta::net::route_matches(rq.path, "/api/lib/enqueue")) {
             std::string key;
             const size_t p = rq.path.find("?k=");
             if (p != std::string::npos) key = urlDecode(rq.path.substr(p + 3));
@@ -10689,10 +10746,10 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     }
 
     // ---------------- 歌词 ----------------
-    if (rq.path.rfind("/api/lyrics", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/lyrics", true)) {
         ct = "application/json; charset=utf-8";
         // 逐源成功率(只读;?reset=1 清零)。必须排在 ?file= 解析之前 —— 它没有 file 参数。
-        if (rq.path.rfind("/api/lyrics/stats", 0) == 0) {
+        if (rta::net::route_matches(rq.path, "/api/lyrics/stats")) {
             const size_t qs = rq.path.find("?reset=");
             const bool reset = qs != std::string::npos && rq.path.substr(qs + 7, 1) == "1";
             return lyr_stats_json(reset);
@@ -10864,7 +10921,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     //   POST /api/sq/rename?from=A&to=B 改名（目标已存在则拒绝）
     //   POST /api/sq/delete?name=X      删除
     //   POST /api/sq/play?name=X&i=0    装进当前队列（前端随后 /api/play 起播第一首）
-    if (rq.path.rfind("/api/sq", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/sq", true)) {
         ct = "application/json; charset=utf-8";
         sq_load_if_needed();
         auto sqp = [&](const char* key) -> std::string {
@@ -10906,7 +10963,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
             return o;
         };
 
-        if (rq.path.rfind("/api/sq/list", 0) == 0) {
+        if (rta::net::route_matches(rq.path, "/api/sq/list")) {
             std::ostringstream j;
             j << "{\"ok\":true,\"queues\":[";
             {
@@ -10921,7 +10978,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
             j << "]}";
             return j.str();
         }
-        if (rq.path.rfind("/api/sq/info", 0) == 0) {
+        if (rta::net::route_matches(rq.path, "/api/sq/info")) {
             // 只读：某个具名队列的曲目明细（详情页要用；不碰当前队列）
             const std::string name = sqName(sqp("name"));
             std::vector<QItem> items;
@@ -10941,7 +10998,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
             j << "]}";
             return j.str();
         }
-        if (rq.path.rfind("/api/sq/save", 0) == 0) {
+        if (rta::net::route_matches(rq.path, "/api/sq/save")) {
             const std::string name = sqName(sqp("name"));
             if (name.empty()) return "{\"ok\":false,\"error\":\"缺少队列名字\"}";
             std::vector<QItem> items;
@@ -10966,7 +11023,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
             j << "}";
             return j.str();
         }
-        if (rq.path.rfind("/api/sq/rename", 0) == 0) {
+        if (rta::net::route_matches(rq.path, "/api/sq/rename")) {
             const std::string from = sqName(sqp("from"));
             const std::string to   = sqName(sqp("to"));
             if (from.empty() || to.empty()) return "{\"ok\":false,\"error\":\"缺少 from/to 参数\"}";
@@ -10993,7 +11050,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
             j << "}";
             return j.str();
         }
-        if (rq.path.rfind("/api/sq/delete", 0) == 0) {
+        if (rta::net::route_matches(rq.path, "/api/sq/delete")) {
             const std::string name = sqName(sqp("name"));
             if (name.empty()) return "{\"ok\":false,\"error\":\"缺少 name 参数\"}";
             bool found = false, saved = false;
@@ -11010,7 +11067,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
             if (!found) return "{\"ok\":false,\"error\":\"队列不存在\"}";
             return std::string("{\"ok\":") + (saved ? "true" : "false") + ",\"name\":\"" + jesc(name) + "\"}";
         }
-        if (rq.path.rfind("/api/sq/play", 0) == 0) {
+        if (rta::net::route_matches(rq.path, "/api/sq/play")) {
             const std::string name = sqName(sqp("name"));
             const std::string idxS = sqp("i");
             std::vector<QItem> items;
@@ -11043,7 +11100,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
 
     // ---------------- 播放列表 ----------------
     // 注意：不能写成 rfind("/api/pl",0)，否则 /api/play 会被这里截走（本轮真踩到）
-    if (rq.path.rfind("/api/pl/", 0) == 0 || rq.path == "/api/pl") {
+    if (rta::net::route_matches(rq.path, "/api/pl", true) || rq.path == "/api/pl") {
         ct = "application/json; charset=utf-8";
         auto plDir = [] {
             wchar_t buf[MAX_PATH];
@@ -11197,8 +11254,8 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
             if (!valid_utf8(file)) return utf8_path_reject(file);
             const std::string csS = qparam("cue_start");
             const std::string ceS = qparam("cue_end");
-            QItem it(file, csS.empty() ? -1.0 : std::atof(csS.c_str()),
-                           ceS.empty() ? -1.0 : std::atof(ceS.c_str()));
+            QItem it(file, csS.empty() ? -1.0 : rta::net::request_number(csS, "cue_start"),
+                           ceS.empty() ? -1.0 : rta::net::request_number(ceS, "cue_end"));
             std::vector<QItem> items;
             loadList(name, items);          // 不存在 → out 为空，等价于新建
             items.push_back(it);
@@ -11374,7 +11431,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
                             "s > 文件时长 " + std::to_string(mi.duration) + "s") + "\"}";
             play_log("PLAY_CUE cue=" + cue_range_text(p.cueStart, p.cueEnd) + " file=" + p.file);
         }
-        g_params = p;
+        params_store(p);
 
         // 先停掉上一次
         ps.stop.store(true);
@@ -11437,7 +11494,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         return "{\"ok\":true}";
     }
 
-    if (rq.path.rfind("/api/qdel", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/qdel")) {
         ct = "application/json; charset=utf-8";
         size_t idx = 0;
         const size_t q = rq.path.find("?i=");
@@ -11465,7 +11522,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         queue_save();
         return "{\"ok\":true,\"count\":" + std::to_string(cnt) + "}";
     }
-    if (rq.path.rfind("/api/qmove", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/qmove")) {
         ct = "application/json; charset=utf-8";
         size_t from = 0, to = 0;
         { const size_t q = rq.path.find("?from="); if (q != std::string::npos) from = (size_t)atoi(rq.path.c_str() + q + 6); }
@@ -11501,7 +11558,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     //      队列可能是用户精心排的 ⟹ 必须有后悔药。
     //   ③ **落回后端 items**：排序不只是前端显示顺序（拖拽排序本来就改后端），
     //      两套顺序并存必然出现"看到的和播放的不一致"。
-    if (rq.path.rfind("/api/qsort", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/qsort")) {
         ct = "application/json; charset=utf-8";
         std::string by = "default";
         { const size_t q = rq.path.find("?by="); if (q != std::string::npos) by = urlDecode(rq.path.substr(q + 4)); }
@@ -11526,7 +11583,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         return "{\"ok\":true,\"by\":\"default\",\"n\":" + std::to_string(n) +
                ",\"index\":" + std::to_string(newIndex) + "}";
     }
-    if (rq.path.rfind("/api/qorder", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/qorder")) {
         ct = "application/json; charset=utf-8";
         std::string files;
         {
@@ -11592,7 +11649,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         return "{\"ok\":true,\"n\":" + std::to_string(n) + ",\"index\":" + std::to_string(newIndex) + "}";
     }
 
-    if (rq.path.rfind("/api/add", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/add")) {
         ct = "application/json; charset=utf-8";
         PlayParams p = parseForm(rq.body);   // 非 const：远程曲目会把 p.file 换成缓存路径
         // 远程曲目：先把原始文件完整下载到缓存，再走与本地完全相同的解码与 DSP 路径
@@ -11640,10 +11697,10 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     }
 
     // ---------------- 收藏（新增 /api/fav?file=...&on=1 与 /api/fav/list）----------------
-    if (rq.path.rfind("/api/fav", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/fav", true)) {
         ct = "application/json; charset=utf-8";
         fav_load_if_needed();
-        if (rq.path.rfind("/api/fav/list", 0) == 0) {
+        if (rta::net::route_matches(rq.path, "/api/fav/list")) {
             // ?meta=1（用户 261026-08 #5）：多回一份 title/artist/album/dur，供「我的最爱」页显示。
             // 不带 meta 时**逐字节保持旧契约**（纯路径字符串数组），老调用点/老脚本零影响。
             const bool wantMeta = rq.path.find("meta=1") != std::string::npos;
@@ -11729,14 +11786,14 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         return j.str();
     }
 
-    if (rq.path.rfind("/api/src", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/src", true)) {
         ct = "application/json; charset=utf-8";
         auto& mgr = SourceManager::instance();
         // 2026-10-24（用户 261024-01 #5）：单服务器 → 多服务器。
         //   GET  /api/src/config             → 服务器列表 + 当前启用（密码只回 hasPass，永不回明文）
         //   POST /api/src/config action=add|update|remove|active …
         //        （无 action 且带 kind/base/user/pass = 旧协议：更新当前启用服务器，保持兼容）
-        if (rq.path.rfind("/api/src/config", 0) == 0) {
+        if (rta::net::route_matches(rq.path, "/api/src/config")) {
             if (rq.method == "POST") {
                 std::map<std::string, std::string> f;
                 std::istringstream is(rq.body);
@@ -11811,7 +11868,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
             j << "]}";
             return j.str();
         }
-        if (rq.path.rfind("/api/src/ping", 0) == 0) {
+        if (rta::net::route_matches(rq.path, "/api/src/ping")) {
             std::string err;
             bool ok = false;
             if (rq.method == "POST") {
@@ -11847,8 +11904,8 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
             }
             return std::string("{\"ok\":") + (ok ? "true" : "false") + ",\"error\":\"" + jesc(err) + "\"}";
         }
-        if (rq.path.rfind("/api/src/browse", 0) == 0 || rq.path.rfind("/api/src/search", 0) == 0) {
-            const bool isSearch = rq.path.rfind("/api/src/search", 0) == 0;
+        if (rta::net::route_matches(rq.path, "/api/src/browse") || rta::net::route_matches(rq.path, "/api/src/search")) {
+            const bool isSearch = rta::net::route_matches(rq.path, "/api/src/search");
             std::string key;
             const size_t q = rq.path.find(isSearch ? "?q=" : "?id=");
             if (q != std::string::npos) key = urlDecode(rq.path.substr(q + (isSearch ? 3 : 4)));
@@ -11873,7 +11930,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
             j << "]}";
             return j.str();
         }
-        if (rq.path.rfind("/api/src/cover", 0) == 0) {
+        if (rta::net::route_matches(rq.path, "/api/src/cover")) {
             std::string id;
             const size_t q = rq.path.find("?id=");
             if (q != std::string::npos) id = urlDecode(rq.path.substr(q + 4));
@@ -11887,7 +11944,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     // ---------------- 数据源注册表(P1.5;设置页动态渲染依据) ----------------
     // GET /api/providers → 注册表内容 + 当前开关状态(rlplayer-settings.conf,旧键迁移读取)。
     // UI 启动时拉一次,按 items 逐源渲染 metasrc_<id> 开关 —— 新增数据源前端零改动。
-    if (rq.path.rfind("/api/providers", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/providers")) {
         ct = "application/json; charset=utf-8";
         const MetaSettings ms = meta_settings_load();
         std::ostringstream j;
@@ -11910,7 +11967,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     // ---------------- 单曲元数据补全(同步;按设置组装 EnrichOpts) ----------------
     // /api/enrich?file=...&force=1 → enrich_track 结果 JSON。正常命中数秒返回;
     // 全源超时的最坏情形可能超 20s(enrich.h 头注「未解决项」如实记录)。
-    if (rq.path.rfind("/api/enrich", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/enrich")) {
         ct = "application/json; charset=utf-8";
         std::string file;
         bool force = false;
@@ -11946,7 +12003,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         return j.str();
     }
 
-    if (rq.path.rfind("/api/meta", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/meta")) {
         ct = "application/json; charset=utf-8";
         std::string file;
         const size_t q = rq.path.find("?file=");
@@ -12101,9 +12158,9 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     //                               已有批次在跑时 {"ok":false,"running":true}
     // GET  /api/writeback/status    {"running","done","total","written","skipped",
     //                               "failed","lastFailures"[≤10],"error"}
-    if (rq.path.rfind("/api/writeback", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/writeback", true)) {
         ct = "application/json; charset=utf-8";
-        if (rq.path.rfind("/api/writeback/status", 0) == 0) {
+        if (rta::net::route_matches(rq.path, "/api/writeback/status")) {
             std::lock_guard<std::mutex> lk(g_wb.mtx);
             std::ostringstream j;
             j << "{\"ok\":true,\"running\":" << (g_wb.running ? "true" : "false")
@@ -12157,7 +12214,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     }
 
     // ---------------- 资料层(P3④a 实体权威文本与来源 materials): GET /api/entity/knowledge ----------------
-    if (rq.path.rfind("/api/entity/knowledge", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/entity/knowledge")) {
         ct = "application/json; charset=utf-8";
         std::string kindStr = "person";
         std::string name;
@@ -12251,7 +12308,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     }
 
     // ---------------- 资料层(P3③ 检索综合): GET /api/entity/summary ----------------
-    if (rq.path.rfind("/api/entity/summary", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/entity/summary")) {
         ct = "application/json; charset=utf-8";
         std::string kindStr = "person";
         std::string name;
@@ -12281,6 +12338,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
                 else if (k == "lang") lang = v;
             }
         }
+        if (!rta::meta::summary_language_valid(lang)) throw rta::net::InvalidRequest("Invalid summary language");
         if (name.empty()) {
             return "{\"ok\":false,\"error\":\"未指定实体名称\"}";
         }
@@ -12429,7 +12487,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     }
 
     // ---------------- 资料层(P3④b Discogs L4 古典作品版本推荐): GET /api/entity/versions ----------------
-    if (rq.path.rfind("/api/entity/versions", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/entity/versions")) {
         ct = "application/json; charset=utf-8";
         std::string kindStr = "work";
         std::string name;
@@ -12464,7 +12522,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         return rta::meta::work_versions_to_json(wr);
     }
 
-    if (rq.path.rfind("/api/cover", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/cover")) {
         std::string file;
         const size_t q = rq.path.find("?file=");
         if (q != std::string::npos) file = urlDecode(rq.path.substr(q + 6));
@@ -12517,7 +12575,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     //   0=关闭循环（顺序播完停止） 1=专辑/列表循环 2=单曲循环 3=随机播放（打乱后循环）
     // 一个端点写一个字段（g_q.repeat），图标与行为不可能再分叉 —— 这就是本项需求的核心。
     // 不带 mode 时只回报当前状态（只读语义，给自检/脚本用）。
-    if (rq.path.rfind("/api/playmode", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/playmode")) {
         ct = "application/json; charset=utf-8";
         int mode = -1;
         auto gv = [&](const char* key) -> int {
@@ -12560,7 +12618,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     // /api/shuffle：保留给老前端/老脚本，但**语义收敛为四态模式的别名**
     //   on=1 → 模式 3（随机）；on=0 → 从随机退回模式 1（列表循环）。
     //   不再允许"随机 + 单曲"这种第五、第六种组合（那正是两处真相打架的来源）。
-    if (rq.path.rfind("/api/shuffle", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/shuffle")) {
         ct = "application/json; charset=utf-8";
         int on = 1;
         const size_t q = rq.path.find("?on=");
@@ -12582,7 +12640,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     //   普通曲目 = <路径>；CUE 分轨 = <路径><TAB><cs><TAB><ce>（与 rlplayer-playlist.txt 同格式）
     // 为什么要一个"整列替换"：先 /api/clear 再 N 次 /api/add 会留下中间态
     // （播放线程可能抢到空队列/半截队列），而"播放全部"必须一次到位。
-    if (rq.path.rfind("/api/queue/set", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/queue/set")) {
         ct = "application/json; charset=utf-8";
         std::string files;
         {
@@ -12619,7 +12677,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         queue_save();
         return "{\"ok\":true,\"count\":" + std::to_string(cnt) + "}";
     }
-    if (rq.path.rfind("/api/queue", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/queue", true)) {
         ct = "application/json; charset=utf-8";
         // meta=1（261027-02 #4）：额外回一个与 items **逐项对齐**的 metas 数组
         //   {t:标题, a:艺术家, al:专辑, d:时长秒, y:年份} —— 队列页排序要用它。
@@ -12706,7 +12764,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         return j.str();
     }
 
-    if (rq.path.rfind("/api/clear", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/clear")) {
         ct = "application/json; charset=utf-8";
         ps.stop.store(true);
         ps.joinIfDone();
@@ -12732,7 +12790,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
 
     // /api/repeat：老入口，参数名沿用 rate=（= 模式号），语义与 /api/playmode 完全一致。
     // 现在允许 rate=0..3（3 = 随机），并把 shuffle 一起收敛（唯一真相源 = g_q.repeat）。
-    if (rq.path.rfind("/api/repeat", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/repeat")) {
         ct = "application/json; charset=utf-8";
         PlayParams p = parseForm(rq.body);
         int mode = atoi(p.rate.c_str());
@@ -12750,7 +12808,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         return j.str();
     }
 
-    if (rq.path.rfind("/api/skip", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/skip")) {
         // ?dir=1 下一首，?dir=-1 上一首
         ct = "application/json; charset=utf-8";
         int dir = 1;
@@ -12761,7 +12819,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         ps.joinIfDone();
         ps.stop.store(false);
 
-        PlayParams p = g_params;
+        PlayParams p = params_snapshot();
         size_t target = 0;
         bool ok = false;
         {
@@ -12812,9 +12870,9 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     }
 
     // ---------------- UPnP/DLNA 媒体投放（ROADMAP P5b）----------------
-    if (rq.path.rfind("/api/cast", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/cast", true)) {
         ct = "application/json; charset=utf-8";
-        if (rq.path.rfind("/api/cast/devices", 0) == 0) {
+        if (rta::net::route_matches(rq.path, "/api/cast/devices")) {
             bool forceRescan = (rq.path.find("scan=1") != std::string::npos || rq.path.find("rescan=1") != std::string::npos);
             auto devs = rta::net::CastManager::instance().get_devices(forceRescan);
             std::ostringstream j;
@@ -12836,7 +12894,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
             j << "]}";
             return j.str();
         }
-        if (rq.path.rfind("/api/cast/state", 0) == 0) {
+        if (rta::net::route_matches(rq.path, "/api/cast/state")) {
             auto st = rta::net::CastManager::instance().get_state();
             std::ostringstream j;
             j << "{\"ok\":true"
@@ -12860,17 +12918,22 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
               << "}";
             return j.str();
         }
-        if (rq.path.rfind("/api/cast/start", 0) == 0) {
+        if (rta::net::route_matches(rq.path, "/api/cast/start")) {
             if (rq.method != "POST") return "{\"ok\":false,\"error\":\"Method Not Allowed\"}";
             rta::net::CastStartParams p;
             if (!rq.body.empty() && rq.body.front() == '{') {
                 auto j = rta::net::json_parse(rq.body);
+                if (j.type != rta::net::Json::Obj) throw rta::net::InvalidRequest("Invalid cast JSON");
+                auto number = [&](const char* key) {
+                    if (j[key].type != rta::net::Json::Num) throw rta::net::InvalidRequest(std::string("Expected numeric field: ") + key);
+                    return j[key].num;
+                };
                 if (j.has("dev")) p.dev = j["dev"].s();
                 if (j.has("file")) p.file = j["file"].s();
-                if (j.has("port")) p.port = (uint16_t)j["port"].n();
-                if (j.has("rate")) p.rate = (uint32_t)j["rate"].n();
-                if (j.has("bits")) p.bits = (int)j["bits"].n();
-                if (j.has("seconds")) p.seconds = j["seconds"].n();
+                if (j.has("port")) p.port = rta::net::request_integral<uint16_t>(number("port"), "port");
+                if (j.has("rate")) p.rate = rta::net::request_integral<uint32_t>(number("rate"), "rate");
+                if (j.has("bits")) p.bits = rta::net::request_integral<int>(number("bits"), "bits");
+                if (j.has("seconds")) p.seconds = number("seconds");
                 if (j.has("dop")) p.dop = (j["dop"].type == rta::net::Json::Bool) ? j["dop"].b : (j["dop"].n() != 0.0);
             } else {
                 std::istringstream is(rq.body);
@@ -12882,10 +12945,10 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
                     std::string v = urlDecode(tok.substr(eq + 1));
                     if (k == "dev") p.dev = v;
                     else if (k == "file") p.file = v;
-                    else if (k == "port") p.port = (uint16_t)std::atoi(v.c_str());
-                    else if (k == "rate") p.rate = (uint32_t)std::strtoul(v.c_str(), nullptr, 10);
-                    else if (k == "bits") p.bits = std::atoi(v.c_str());
-                    else if (k == "seconds") p.seconds = std::atof(v.c_str());
+                    else if (k == "port") p.port = rta::net::request_integral<uint16_t>(rta::net::request_number(v,"port"),"port");
+                    else if (k == "rate") p.rate = rta::net::request_integral<uint32_t>(rta::net::request_number(v,"rate"),"rate");
+                    else if (k == "bits") p.bits = rta::net::request_integer(v,"bits");
+                    else if (k == "seconds") p.seconds = rta::net::request_number(v,"seconds");
                     else if (k == "dop") p.dop = (v == "1" || v == "true");
                 }
             }
@@ -12904,7 +12967,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
             }
             return "{\"ok\":true,\"started\":true,\"phase\":\"discovering\"}";
         }
-        if (rq.path.rfind("/api/cast/stop", 0) == 0) {
+        if (rta::net::route_matches(rq.path, "/api/cast/stop")) {
             rta::net::CastManager::instance().stop();
             g_upnpPlayer.store(false);
             ps.playing.store(false);
@@ -12916,7 +12979,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
 
     // 261024-05：/api/naa/discover 已按用户要求删除（数播只认 HQPlayer 私有握手，无法对接）。
 
-    if (rq.path.rfind("/api/upnp", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/upnp")) {
         ct = "application/json; charset=utf-8";
         // 2026-10-23（用户 261023-04 #11）：多网卡逐卡发 M-SEARCH + 诊断信息，
         // 并且在 JSON 里把"为什么没搜到"如实说出来（组播被代理/防火墙/AP 隔离拦截是最常见原因）。
@@ -12947,12 +13010,12 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     // ★ 不并入 /api/settings：那个端点写 rlplayer-settings.conf（整文件重写），
     //   key 混进去会被诊断包 / 导出 / 同步顺手带走，而且 POST 白名单里也不该有它。
     //   本端点单独写 rlplayer-llm.conf，且 GET 只回掩码。
-    if (rq.path.rfind("/api/llm", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/llm", true)) {
         ct = "application/json; charset=utf-8";
         // 2026-10-27（用户 261027-06 P1）：模型列表。必须排在 POST 分支之前 —— 它是只读 GET，
         // 且要能在「没配 key / 断网 / 网关 404」时仍然回 200 + ok:false（设置页优雅降级）。
-        if (rq.path.rfind("/api/llm/models", 0) == 0) return llm_models_json(rq.path);
-        if (rq.path.rfind("/api/llm/test", 0) == 0) return llm_test_json();
+        if (rta::net::route_matches(rq.path, "/api/llm/models")) return llm_models_json(rq.path);
+        if (rta::net::route_matches(rq.path, "/api/llm/test")) return llm_test_json();
         if (rq.method != "POST") return llm_status_json();
 
         std::map<std::string, std::string> f;
@@ -13011,11 +13074,11 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     // GET  /api/peq            → 当前状态 + 预设列表 + 频响曲线
     // POST /api/peq            → 更新 bypass/preamp/bands（热更新 + 落盘），返回同样结构
     // POST /api/peq/preset     → action=save|load|delete|reset & name=...
-    if (rq.path.rfind("/api/peq", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/peq", true)) {
         ct = "application/json; charset=utf-8";
         if (!g_peq) peq_load_current();
 
-        if (rq.path.rfind("/api/peq/preset", 0) == 0) {
+        if (rta::net::route_matches(rq.path, "/api/peq/preset")) {
             std::map<std::string, std::string> f;
             std::istringstream is(rq.body);
             std::string tok;
@@ -13082,7 +13145,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
             }
             rta::dsp::PeqSettings s = g_peq->settings();
             if (f.count("bypass")) s.bypass = (f["bypass"] == "1" || f["bypass"] == "true");
-            if (f.count("preamp")) s.preampDb = std::min(std::max(std::atof(f["preamp"].c_str()), -24.0), 24.0);
+            if (f.count("preamp")) s.preampDb = std::min(std::max(rta::net::request_number(f["preamp"], "preamp"), -24.0), 24.0);
             if (f.count("name") && !f["name"].empty()) s.presetName = f["name"];
             if (f.count("bands")) {
                 std::vector<rta::dsp::PeqBand> bands;
@@ -13098,7 +13161,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     }
 
     // ---------------- 耳机 EQ（OPRA 预设管理）----------------
-    if (rq.path.rfind("/api/opra/index", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/opra/index")) {
         ct = "application/json; charset=utf-8";
         rta::dsp::OpraService::instance().init(path_in_exe_dir("data\\opra_index.json"), path_in_exe_dir(""));
         const auto& index = rta::dsp::OpraService::instance().index();
@@ -13147,7 +13210,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         }
         return j.str();
     }
-    if (rq.path.rfind("/api/opra/presets", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/opra/presets")) {
         ct = "application/json; charset=utf-8";
         rta::dsp::OpraService::instance().init(path_in_exe_dir("data\\opra_index.json"), path_in_exe_dir(""));
         std::string productId;
@@ -13195,7 +13258,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         j << "]}";
         return j.str();
     }
-    if (rq.path.rfind("/api/opra/apply", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/opra/apply")) {
         ct = "application/json; charset=utf-8";
         rta::dsp::OpraService::instance().init(path_in_exe_dir("data\\opra_index.json"), path_in_exe_dir(""));
         std::string productId, presetId;
@@ -13229,10 +13292,12 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     // 局域网监听状态（控制面默认只对本机开放）
     // ---------------- 播放设置持久化 ----------------
     // 没有这个，用户每次重启都要重新选滤波器/抖动/缓冲 —— 日常用起来很烦。
-    if (rq.path.rfind("/api/settings", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/settings")) {
         ct = "application/json; charset=utf-8";
         const std::string sp = path_in_exe_dir("rlplayer-settings.conf");
         if (rq.method == "POST") {
+            (void)parseForm(rq.body); // reject invalid DSP numbers before persisting anything
+
             // 2026-10-23（真实事故后加固）：旧实现 std::ios::trunc + 只写本次提交的键 ——
             // 任何「只提交部分键」的客户端都会把其余设置整份清空。
             // 事故复现：测试脚本只 POST eq=… 一个键 → backend/volume 等被抹掉 → 重启后回落
@@ -13375,7 +13440,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     // ASIO 驱动列表（设置页里显示，让用户知道本机有什么 ASIO 后端）
     //
     // ⚠️ 2026-10-26（用户 261025-02 #4）根因修复：这里原来是
-    //     if (rq.path.rfind("/api/asio", 0) == 0)   ← **前缀匹配**
+    //     if (rta::net::route_matches(rq.path, "/api/asio"))   ← **前缀匹配**
     //   而 "/api/asiodevices" 正好以 "/api/asio" 开头 ⟹ 请求被这个块吃掉，
     //   返回的是 {"drivers":["AudioByte ASIO", …]}（**字符串数组、没有 CLSID**），
     //   可设置页按 {"drivers":[{name,id}]} 解析（ui_script.h 的 loadDeviceList）——
@@ -13397,7 +13462,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     }
 
     // 输出设备列表（设置页里可以选，不再写死"默认设备"）
-    if (rq.path.rfind("/api/devices", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/devices")) {
         ct = "application/json; charset=utf-8";
         std::ostringstream j;
         j << "{\"ok\":true,\"devices\":[";
@@ -13445,7 +13510,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     // 删除 <exe>\rlplayer-buffer-learned.json：之后每次播放都重新按用户设置尝试（必要时再学）。
     // 为什么需要它：学习缓存是为了「不每次都先失败一次」，但用户换了线/固件/驱动后，
     // 旧的 20ms 学习值可能不再必要 —— 不提供重置就只能靠改设置绕。
-    if (rq.path.rfind("/api/buffer/reset", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/buffer/reset")) {
         ct = "application/json; charset=utf-8";
         rta::audio::BufferLearnStore st(path_in_exe_dir("rlplayer-buffer-learned.json"));
         const bool okReset = st.reset();
@@ -13458,7 +13523,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     // 滤波器预设表（含每个预设【自带的相位】）：
     // 用户 2026-10-22 功能2 的诉求是「'跟随预设'到底跟的是什么」说不清。
     // 让后端把真相源交出来，前端只负责显示 —— 避免前端再抄一份相位表（那必然漂移）。
-    if (rq.path.rfind("/api/filters", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/filters")) {
         ct = "application/json; charset=utf-8";
         std::ostringstream j;
         j << "{\"ok\":true,\"items\":[";
@@ -13484,7 +13549,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     }
 
     // 设备能力：只让用户选设备真正支持的采样率（选了不支持的一播放就报错，体验很差）
-    if (rq.path.rfind("/api/rates", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/rates")) {
         ct = "application/json; charset=utf-8";
         std::string devId;
         { const size_t q = rq.path.find("?device="); if (q != std::string::npos) devId = urlDecode(rq.path.substr(q + 8)); }
@@ -13509,17 +13574,17 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     // GET  /api/preset/caps                     → 设备能力（只读探测：不开流、不抢设备）
     // POST /api/preset/apply?profile=…          → 探测 + 决策 + 落盘；返回 applied 与 notes
     // 决策细节全在 engine/preset_profiles.h（纯函数、离线单测），这里只做 IO 与 JSON。
-    if (rq.path.rfind("/api/preset", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/preset", true)) {
         ct = "application/json; charset=utf-8";
-        if (rq.path.rfind("/api/preset/caps", 0) == 0) return preset_caps_json();
-        if (rq.path.rfind("/api/preset/apply", 0) == 0) return preset_apply_json(rq.path);
+        if (rta::net::route_matches(rq.path, "/api/preset/caps")) return preset_caps_json();
+        if (rta::net::route_matches(rq.path, "/api/preset/apply")) return preset_apply_json(rq.path);
         rta::net::webui_set_status(400);
         return std::string("{\"ok\":false,\"error\":\"未知的预设端点：只支持 /api/preset/caps 与 "
                            "/api/preset/apply\"}");
     }
 
     // 拖拽兜底：浏览器拿不到真实路径时，把文件内容传上来，落到 exe 目录下的 uploads
-    if (rq.path.rfind("/api/upload", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/upload")) {
         ct = "application/json; charset=utf-8";
         std::string name = "upload.bin";
         const size_t qp = rq.path.find("?name=");
@@ -13533,16 +13598,18 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         }
         if (safe.empty()) safe = "upload.bin";
         if (!valid_utf8(safe)) return utf8_path_reject(name);   // F1：下方 fs::u8path(full) 消费
-        std::error_code ec;
-        const std::string dir = path_in_exe_dir("uploads");
-        fs::create_directories(fs::u8path(dir), ec);
-        const std::string full = dir + "\\" + safe;
-        std::ofstream of(fs::u8path(full), std::ios::binary | std::ios::trunc);
-        if (!of) return "{\"ok\":false,\"error\":\"无法写入上传目录\"}";
-        of.write(rq.body.data(), (std::streamsize)rq.body.size());
-        of.close();
-        return std::string("{\"ok\":true,\"path\":\"") + jesc(full) + "\",\"size\":" +
-               std::to_string((long long)rq.body.size()) + "}";
+        std::string extension;
+        const auto dot = safe.find_last_of('.');
+        if (dot != std::string::npos) extension = safe.substr(dot + 1);
+        std::string writeError;
+        const std::string full = rta::net::cache_write_new(path_in_exe_dir("uploads"), extension,
+            rq.body.data(), rq.body.size(), writeError, {}, safe);
+        if (full.empty()) {
+            rta::net::webui_set_status(500);
+            return std::string("{\"ok\":false,\"error\":\"") + jesc(writeError) + "\"}";
+        }
+        return std::string("{\"ok\":true,\"path\":\"") + jesc(full) + "\",\"name\":\"" + jesc(safe) +
+            "\",\"size\":" + std::to_string(rq.body.size()) + "}";
     }
 
     // ASIO 驱动列表（后端下拉里选 ASIO 时用它填设备）
@@ -13550,7 +13617,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     //   drivers[{name,id}]        ← 旧契约，id = CLSID（保留，避免已发布脚本/旧页面断掉）
     //   asioDrivers[{name,clsid}] ← 新契约（与 /api/devices 同一份，字段名一致）
     //   asioActive                ← 当前设置指向的 CLSID（"" = 未指定）
-    if (rq.path.rfind("/api/asiodevices", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/asiodevices")) {
         ct = "application/json; charset=utf-8";
         const auto list = rta::audio::asio_enum_drivers();
         std::ostringstream j;
@@ -13565,7 +13632,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
 
     // ---------------- ROADMAP P4b：输入采集与直通监听 API ----------------
     // 设备列表：含 loopback 端点标记、默认、混音率/声道/位深
-    if (rq.path.rfind("/api/input/devices", 0) == 0 || rq.path.rfind("/api/indevices", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/input/devices") || rta::net::route_matches(rq.path, "/api/indevices")) {
         ct = "application/json; charset=utf-8";
         std::ostringstream j;
         j << R"({"ok":true,"devices":[)";
@@ -13595,7 +13662,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     //            monitorOutFrames, monitorDrops}
     // latency* 只在 monitor=dsp 时有意义（其余时刻为 0）；口径见
     // src/audio/wasapi_capture.h 的 monitor_latency_estimate（total 的唯一真相源）。
-    if (rq.path.rfind("/api/input/state", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/input/state")) {
         ct = "application/json; charset=utf-8";
         std::lock_guard<std::mutex> lk(g_inputSession.mtx);
         std::ostringstream j;
@@ -13641,7 +13708,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     // 启动采集：POST /api/input/start
     // 参数：mode=record|monitor、dev=<子串或 id>、loopback=1、out=<wav>、seconds=<上限>；
     // 测试用：src=null&inject=1000:0.001 走模拟源（不开设备、不发声），用于自动化门禁
-    if (rq.path.rfind("/api/input/start", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/input/start")) {
         ct = "application/json; charset=utf-8";
         auto parseParams = [](const rta::net::HttpRequest& req) {
             std::map<std::string, std::string> m;
@@ -13926,7 +13993,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     }
 
     // 停止采集：POST /api/input/stop
-    if (rq.path.rfind("/api/input/stop", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/input/stop")) {
         ct = "application/json; charset=utf-8";
         g_inputSession.stop();
         return R"({"ok":true})";
@@ -13950,7 +14017,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     //      "api_key=..." 整行掩码 —— 诊断 JSON 里没有 key，但 log 理论上可能有）；
     //   ② 只挑【已知文件名】，绝不整目录打包（避免把 rlplayer-llm.conf 之类带 key
     //      的配置文件顺手塞进去）。白名单在下面 kFiles 里写死。
-    if (rq.path.rfind("/api/diagzip", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/diagzip")) {
         ct = "application/zip";
         // 把 secret 抹掉：整行 api_key=/token=/password= 替换，再把 sk-xxx 抹成 sk-***
         auto redact_secrets = [](std::string s) {
@@ -14108,7 +14175,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     // 版本/构建/PID/运行时长/OS/CPU/GPU/内测标识 + 端点探活摘要 + 设置六键 + 日志尾 + 最近错误。
     // 端点探活（probe_formats 对 16/24/32 各跑一遍独占支持率）可能耗时：总预算 3 秒，
     // 超时未探的字段如实写"不可用"，绝不卡住 HTTP 线程。
-    if (rq.path.rfind("/api/diag", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/diag")) {
         ct = "application/json; charset=utf-8";
         std::ostringstream j;
         const bool forceProbe = rq.path.find("refresh=1") != std::string::npos;   // F3：强制重探
@@ -14244,7 +14311,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     //       并把绝对路径回给界面，界面要显示它）。
     // 为什么必须只接受 POST：本端点会打网络 + 往仓库写文件，GET 能触发的端点等于把
     // 「谁都能替用户提交反馈」写进 URL（已进 kNeedPost，非 POST 在上游就 405）。
-    if (rq.path.rfind("/api/feedback", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/feedback")) {
         ct = "application/json; charset=utf-8";
         rta::feedback::LiveState lv;
         lv.source = "rtaweb";
@@ -14286,7 +14353,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     // 为什么要一个独立端点：单曲页的「自动分析」是前端触发的，要证明「一首歌只跑一次」与
     // 「关掉开关后一次都不跑」，必须有一个**不受前端状态影响**的计数源（进程级原子量）。
     // 只读、无副作用，不开任何设备。
-    if (rq.path.rfind("/api/anl/stats", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/anl/stats")) {
         ct = "application/json; charset=utf-8";
         return std::string("{\"ok\":true,\"runs\":") +
                std::to_string(g_anlRuns.load(std::memory_order_relaxed)) +
@@ -14298,7 +14365,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     // 返回 track_health_json()：老字段（dr_db/lufs/lra/peak_dbfs/cutoff_hz/fake24…）一个没动，
     // 新增 quality 段（19 项）。默认流式分块（内存与曲长无关），whole=1 强制整曲解码（对照/排错）。
     // 只读文件、不开任何音频设备。
-    if (rq.path.rfind("/api/health", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/health")) {
         ct = "application/json; charset=utf-8";
         // 2026-10-27（261027-03 #9，两个真根因都在这几行）：
         //  ① 参数切分顺序错了：旧版是「整段 urlDecode → 再按 & 截断」，可是路径里的 & 属于
@@ -14456,7 +14523,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     // 不同、时长不同，不对齐就没法逐项比），再在【公共区段】上重算全部指标，最后给
     // 「逐项对比表 + 可比性 + 排序 + 确定性解释」。不可比项（位深/采样率/声道不同）照样列数值
     // 但 comparable=false + 中文原因，且不参与评分。
-    if (rq.path.rfind("/api/compare", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/compare")) {
         ct = "application/json; charset=utf-8";
         std::vector<std::string> files;
         {
@@ -14574,14 +14641,14 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     }
 
     // 应用标识：启动器用它区分"本程序的实例"和"别的程序占了这个端口"
-    if (rq.path.rfind("/api/ping", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/ping")) {
         ct = "application/json; charset=utf-8";
         return std::string("{\"ok\":true,\"app\":\"RLPlayer\",\"version\":\"") + RLPLAYER_VERSION + "\"}";
     }
 
     // GPU 后端实际情况：后端 DLL 与 HIP 运行库是否在本目录、当前能不能用
     // （设置页要用它把"AMD"标成可用或未构建，而不是让用户选了才发现没后端）
-    if (rq.path.rfind("/api/gpu", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/gpu")) {
         ct = "application/json; charset=utf-8";
         auto dll_here = [](const char* n) {
             const DWORD a = GetFileAttributesA(path_in_exe_dir(n).c_str());
@@ -14618,7 +14685,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         return j.str();
     }
 
-    if (rq.path.rfind("/api/net", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/net")) {
         ct = "application/json; charset=utf-8";
         char hn[256] = {0};
         gethostname(hn, sizeof(hn) - 1);
@@ -14634,7 +14701,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         return j.str();
     }
 
-    if (rq.path.rfind("/api/signal", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/signal")) {
         ct = "application/json; charset=utf-8";
         std::lock_guard<std::mutex> lk(ps.mtx);
         if (ps.signal.empty()) return "{\"ok\":false}";
@@ -14648,7 +14715,8 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
             std::ostringstream dyn;
             dyn << ",\"dspBlockMs\":" << avgDspBlockMs
                 << ",\"dspTotalMs\":" << totalDspMs
-                << ",\"dspChunkUs\":" << ps.dspChunkUs.load()
+                << ",\"dspChunks\":" << ps.dspChunks.load()
+          << ",\"dspChunkUs\":" << ps.dspChunkUs.load()
                 << ",\"scanMs\":" << Library::instance().lastScanMs()
                 // 2026-10-24（用户 261024-04 #8）：路径上的 GPU 事实（**实测**，不是设置项）。
                 //   convGpu     = 本次 IR 卷积真的走了 GPU（CPU 回落/无 IR/无 DLL ⟹ false）
@@ -14664,7 +14732,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         return "{\"ok\":true,\"path\":" + s + "}";
     }
 
-    if (rq.path.rfind("/api/rescan", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/rescan")) {
         Library::instance().startScan(true);
         return "{\"ok\":true}";
     }
@@ -14678,7 +14746,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     //   POST /api/update/download                  增量下载（只下 sha256 不一致的文件）→ 校验 → 解压
     //   POST /api/update/apply                     写台账并让程序退出重启（真正换文件在启动器启动时）
     //   POST /api/update/skip                      body {"version":"1.6.0"}；空串 = 取消跳过
-    if (rq.path.rfind("/api/update/check", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/update/check")) {
         ct = "application/json; charset=utf-8";
         const bool force = rq.path.find("force=1") != std::string::npos;
         const bool wait  = rq.path.find("wait=1") != std::string::npos;
@@ -14686,15 +14754,15 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         else      rta::update::start_check(force);
         return rta::update::check_json();
     }
-    if (rq.path.rfind("/api/update/progress", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/update/progress")) {
         ct = "application/json; charset=utf-8";
         return rta::update::progress_json();
     }
-    if (rq.path.rfind("/api/update/state", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/update/state")) {
         ct = "application/json; charset=utf-8";
         return rta::update::state_json();
     }
-    if (rq.path.rfind("/api/update/download", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/update/download")) {
         ct = "application/json; charset=utf-8";
         std::string err;
         if (!rta::update::start_download(err))
@@ -14702,7 +14770,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         return std::string("{\"ok\":true,\"started\":true,\"progress\":") +
                rta::update::progress_json() + "}";
     }
-    if (rq.path.rfind("/api/update/skip", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/update/skip")) {
         ct = "application/json; charset=utf-8";
         std::string ver;
         {
@@ -14712,7 +14780,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         rta::update::set_skip_version(ver);
         return std::string("{\"ok\":true,\"skipVersion\":\"") + jesc(rta::update::skip_version()) + "\"}";
     }
-    if (rq.path.rfind("/api/update/apply", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/update/apply")) {
         // 只做三件事：校验暂存 → 写台账 → 让程序退出重启。
         // **绝不在这里换文件**：此刻 rtaweb.exe / dll 都被本进程映射着，覆盖必失败；
         // 真正的替换发生在下次 RLPlayer.exe 启动、rtaweb 还没起来的那一刻（update_apply.h）。
@@ -14743,12 +14811,12 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
           << "\"note\":\"程序即将退出；重新打开 RLPlayer 即完成更新\"}";
         return o.str();
     }
-    if (rq.path.rfind("/api/quit", 0) == 0 || rq.path.rfind("/api/shutdown", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/quit") || rta::net::route_matches(rq.path, "/api/shutdown")) {
         g_exitReq.store(true);
         return "{\"ok\":true}";
     }
 
-    if (rq.path.rfind("/api/dbg", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/dbg")) {
         ct = "text/plain; charset=utf-8";
         std::lock_guard<std::mutex> lk(g_logMx);
         std::string s;
@@ -14756,7 +14824,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         return s;
     }
 
-    if (rq.path.rfind("/api/recent", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/recent")) {
         ct = "application/json; charset=utf-8";
         std::ifstream f(path_in_exe_dir("rlplayer-recent.txt"));
         std::ostringstream j;
@@ -14780,22 +14848,33 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         return j.str();
     }
 
-    if (rq.path.rfind("/api/volume", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/volume")) {
         ct = "application/json; charset=utf-8";
         const size_t q = rq.path.find("?db=");
-        double db = 0.0;
-        if (q != std::string::npos) db = atof(urlDecode(rq.path.substr(q + 4)).c_str());
+        if (q == std::string::npos) throw rta::net::InvalidRequest("Missing db");
+        const size_t end = rq.path.find('&', q + 4);
+        double db = rta::net::request_number(urlDecode(rq.path.substr(q + 4, end - (q + 4))), "db");
+        {
+            const auto requested = params_snapshot();
+            std::lock_guard<std::mutex> lk(ps.mtx);
+            if (ps.playing.load() && (requested.dsd >= 64 || requested.dsdNative || ps.outMode == "dop" || ps.outMode == "native")) {
+                rta::net::webui_set_status(409);
+                return "{\"ok\":false,\"error\":\"Live volume is unavailable for DSD; stop playback before changing volume\"}";
+            }
+        }
         if (db > 0.0) db = 0.0;
         if (db < -120.0) db = -120.0;
         ps.volDb.store(db);
+        { std::lock_guard<std::mutex> lk(ps.mtx); publish_integrity_locked(ps); }
         return "{\"ok\":true,\"db\":" + std::to_string(db) + "}";
     }
 
-    if (rq.path.rfind("/api/seek", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/seek")) {
         ct = "application/json; charset=utf-8";
         double frac = 0.0;
         const size_t q = rq.path.find("?pos=");
-        if (q != std::string::npos) frac = atof(rq.path.c_str() + q + 5);
+        if (q == std::string::npos) throw rta::net::InvalidRequest("Missing pos");
+        frac = rta::net::request_number(urlDecode(rq.path.substr(q + 5, rq.path.find('&', q + 5) - (q + 5))), "pos");
         if (frac < 0.0) frac = 0.0;
         if (frac > 1.0) frac = 1.0;
         // 后端 = UPnP（261024-01 #9）：进度条跳转转交投放会话（worker 里发 AVTransport Seek REL_TIME）。
@@ -14812,7 +14891,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         return "{\"ok\":true}";
     }
 
-    if (rq.path.rfind("/api/pause", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/pause")) {
         ct = "application/json; charset=utf-8";
         int on = 1;
         const size_t q = rq.path.find("?on=");
@@ -14826,7 +14905,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         return std::string("{\"ok\":true,\"paused\":") + ((on != 0) ? "true" : "false") + "}";
     }
 
-    if (rq.path.rfind("/api/stop", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/stop")) {
         ct = "application/json; charset=utf-8";
         // CD 音轨：MCI 停播 + 关设备，然后照常走下面的管线停止（两条路互不干扰）
         if (g_cdActive.exchange(false)) {
@@ -14850,7 +14929,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         return "{\"ok\":true}";
     }
 
-    if (rq.path.rfind("/api/status", 0) == 0) {
+    if (rta::net::route_matches(rq.path, "/api/status")) {
         ct = "application/json; charset=utf-8";
         // 261024-01 #9：后端 = UPnP 时，播放器状态唯一来源 = 投放会话（一条会话、一个数字），
         // 否则底栏与「投放实时状态」会各显示一套进度，互相打架。
@@ -14897,8 +14976,8 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         const std::string curStat = castMode ? castSt.sourceFile : ps.current;
         const std::string errStat = castMode ? castSt.error : ps.error;
         // CD 是红皮书标准：44100 Hz / 16 bit / 2ch
-        const uint32_t rateStat = cdMode ? 44100u : (castMode ? castSt.sampleRate : ps.outRate);
-        const int bitsStat = cdMode ? 16 : (castMode ? castSt.bits : ps.outBits);
+        const uint32_t rateStat = cdMode ? 44100u : (castMode ? castSt.sampleRate : (uint32_t)ps.outRate.load());
+        const int bitsStat = cdMode ? 16 : (castMode ? castSt.bits : ps.outBits.load());
         // 2026-10-24（用户 261024-04 #8）：GPU 语义拆分。组合语义的唯一事实源 =
         // rta::meta::playback_gpu_flags（src/meta/statusflags.h，带真值表与单测）：
         //   gpu         = GPU 可用性（与本次播放无关，旧字段名保留）
@@ -14956,6 +15035,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
           << ",\"decodeMs\":" << ps.decodeMs.load()
           << ",\"ffmpegMs\":" << ps.ffmpegMs.load()
           << ",\"wavReadMs\":" << ps.wavReadMs.load()
+          << ",\"dspChunks\":" << ps.dspChunks.load()
           << ",\"dspChunkUs\":" << ps.dspChunkUs.load()
           << ",\"dspBlockMs\":" << (ps.dspChunks.load() > 0 ? (double)ps.dspTotalUs.load() / (ps.dspChunks.load() * 1000.0) : 0.0)
           << ",\"dspTotalMs\":" << ((double)ps.dspTotalUs.load() / 1000.0)
@@ -15023,6 +15103,9 @@ static std::string page() {
 }
 
 int main(int argc, char** argv) {
+    rta::update::InstallRuntimeGuard installation(rta::update::install_dir(), false);
+    if (!installation.ok()) { std::fprintf(stderr, "%s\n", installation.error().c_str()); return 1; }
+
     rta::crash::install();    // 崩溃转储（1.0.5）：dump 落 exe 目录 dumps\，filter 先写日志
     SetConsoleOutputCP(CP_UTF8);
     setvbuf(stdout, nullptr, _IONBF, 0);
@@ -15153,9 +15236,11 @@ int main(int argc, char** argv) {
     printf("  （只监听本机；播放会以独占模式接管音频设备）\n");
     printf("  按 Ctrl+C 退出\n");
     while (!g_exitReq.load()) std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    g_ps.stop.store(true);
-    g_ps.joinIfDone();
-    ui.stop();
+    ui.stop(); // no new commands; wait for active handlers before joining the playback owner
+    { std::lock_guard<std::mutex> command(g_commandMx);
+      g_ps.stop.store(true);
+      g_ps.joinIfDone();
+    }
     // ---- 2026-10-25：退出崩溃（0xC0000409 / __fastfail）取证 + 收尾 ----
     // 现象：/api/quit 后约 1.9~2.1 秒进程以 0xC0000409 退出（无工作、有工作都一样）。
     // 该码在 MSVC/CRT 里最常见的来源是 **std::terminate**（例如 joinable 的 std::thread 被析构）。

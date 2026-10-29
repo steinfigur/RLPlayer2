@@ -32,6 +32,7 @@
 #include <vector>
 
 #include "net/update.h"
+#include "net/update_process.h"
 
 namespace rta::update {
 
@@ -119,6 +120,8 @@ struct PendingPlan {
     std::string staging;
     std::string time;
     std::string detail;
+    std::string manifestSha; // Binds ready intent to the exact completed full manifest.
+    std::map<std::string, std::string> originalSha; // Existing bytes, persisted before any move.
     std::vector<std::string> files;    // 计划安装的文件（相对路径）
     std::vector<std::string> applied;  // 实际替换成功的（回滚用）
     std::vector<std::string> added;    // 本来不存在、本次新增的（回滚时删掉）
@@ -145,6 +148,11 @@ inline PendingPlan read_pending() {
         else if (k == "staging") p.staging = v;
         else if (k == "time") p.time = v;
         else if (k == "detail") p.detail = v;
+        else if (k == "manifestSha") p.manifestSha = v;
+        else if (k == "old_sha") {
+            const size_t sep = v.find('\t');
+            if (sep != std::string::npos) p.originalSha[v.substr(0, sep)] = v.substr(sep + 1);
+        }
         else if (k == "file") p.files.push_back(v);
         else if (k == "applied") p.applied.push_back(v);
         else if (k == "added") p.added.push_back(v);
@@ -160,10 +168,12 @@ inline bool write_pending(const PendingPlan& p) {
     t += "staging=" + p.staging + "\r\n";
     t += "time=" + p.time + "\r\n";
     if (!p.detail.empty()) t += "detail=" + p.detail + "\r\n";
+    if (!p.manifestSha.empty()) t += "manifestSha=" + p.manifestSha + "\r\n";
+    for (const auto& e : p.originalSha) t += "old_sha=" + e.first + "\t" + e.second + "\r\n";
     for (const auto& f : p.files) t += "file=" + f + "\r\n";
     for (const auto& f : p.applied) t += "applied=" + f + "\r\n";
     for (const auto& f : p.added) t += "added=" + f + "\r\n";
-    return write_text_file(pending_path(), t);
+    return write_update_atomic(pending_path(), t);
 }
 
 inline std::string now_text() {
@@ -181,12 +191,20 @@ inline std::string backup_dir(const std::string& ver) { return join_path(version
 // 把 staging 里的文件清单写进台账（端点 /apply 调用）
 inline bool write_ready_plan(const std::string& ver, const std::string& from,
                              const std::string& staging, std::string& err) {
-    if (!is_dir(staging)) { err = "暂存目录不存在：" + staging; return false; }
+    UpdateWriterLease writer(err);
+    if (!writer.owns_lock()) return false;
+    { auto& s = state(); std::lock_guard<std::mutex> lock(s.mtx);
+      if (s.downloading) { err = "更新尚未下载完成"; return false; } }
+    StagingManifest manifest;
+    if (!verify_staging(ver, staging, manifest, err)) return false;
+    const PendingPlan previous = read_pending();
+    if (previous.exists && (previous.phase == "applying" || previous.phase == "applied" ||
+        previous.phase == "rollback_failed")) { err = "已有未结束的更新事务，保留备份和台账"; return false; }
     std::vector<std::string> rels;
-    list_files_rel(staging, "", rels);
-    if (rels.empty()) { err = "暂存目录里没有文件"; return false; }
+    for (const auto& e : manifest.files) if (e.staged) rels.push_back(e.file.path);
     PendingPlan p;
     p.phase = "ready";
+    p.manifestSha = sha256_hex(read_text_file(staging_manifest_path(ver)));
     p.version = ver;
     p.from = from;
     p.staging = staging;
@@ -204,125 +222,150 @@ inline bool move_file(const std::string& from, const std::string& to) {
     if (::MoveFileExW(wf.c_str(), wt.c_str(), MOVEFILE_REPLACE_EXISTING)) return true;
     if (!::CopyFileW(wf.c_str(), wt.c_str(), FALSE)) return false;
     ::SetFileAttributesW(wf.c_str(), FILE_ATTRIBUTE_NORMAL);
-    ::DeleteFileW(wf.c_str());
+    return ::DeleteFileW(wf.c_str()) != 0;
+}
+
+// Rollback uses the journal written BEFORE touching each file. A crash after moving
+// the old file but before installing the new one therefore still has a recovery entry.
+inline bool rollback_files(PendingPlan& p, std::string& detail) {
+    if (!parse_version(p.version).valid || p.version.find_first_of("/\\\r\n") != std::string::npos ||
+        p.staging != join_path(version_dir(p.version), "staging")) { detail += "；事务路径非法"; return false; }
+    std::set<std::string> seen;
+    for (const auto& rel : p.applied) {
+        if (!safe_install_rel(rel) || is_protected_rel(rel) || !seen.insert(lower_ascii(norm_rel(rel))).second ||
+            std::find(p.files.begin(), p.files.end(), rel) == p.files.end()) { detail += "；事务文件记录非法"; return false; }
+    }
+    for (const auto& rel : p.added) if (std::find(p.applied.begin(), p.applied.end(), rel) == p.applied.end()) {
+        detail += "；新增文件事务记录非法"; return false;
+    }
+    const std::string inst = install_dir(), bak = backup_dir(p.version);
+    std::vector<std::string> unresolved;
+    for (auto it = p.applied.rbegin(); it != p.applied.rend(); ++it) {
+        const std::string tgt = join_path(inst, *it), b = join_path(bak, *it);
+        const bool added = std::find(p.added.begin(), p.added.end(), *it) != p.added.end();
+        bool ok = false;
+        if (added) ok = !path_exists(tgt) || ::DeleteFileW(rta::platform::from_utf8(tgt).c_str()) != 0;
+        else {
+            const auto original = p.originalSha.find(*it);
+            auto matches_original = [&](const std::string& path) {
+                std::string hex, error;
+                return original != p.originalSha.end() && sha256_file(path, hex, error) &&
+                    hex_equals_ci(hex, original->second);
+            };
+            if (path_exists(b)) {
+                // Legacy journals can still restore an extant backup; new journals
+                // verify its bytes before consuming the recovery material.
+                ok = (original == p.originalSha.end() || matches_original(b)) && move_file(b, tgt);
+            } else ok = matches_original(tgt); // prove old bytes, never infer rollback from existence
+        }
+        if (!ok) unresolved.push_back(*it);
+    }
+    if (!unresolved.empty()) {
+        detail += "；回滚未完成，保留备份/台账：";
+        for (const auto& rel : unresolved) detail += rel + " ";
+        return false;
+    }
     return true;
 }
-
-// ===========================================================================
-// 3. 落地（启动器 main() 最开头，rtaweb 尚未启动时调用）
-// ===========================================================================
-inline std::string apply_pending_on_startup() {
+inline std::string rollback_pending(const std::string& why) {
+    std::string leaseError; UpdateWriterLease writer(leaseError);
+    if (!writer.owns_lock()) return "UPDATE 未执行：" + leaseError;
     PendingPlan p = read_pending();
-    if (!p.exists) return std::string();
-    if (p.phase != "ready") return std::string();
-    const std::string inst = install_dir();
-    if (p.staging.empty() || !is_dir(p.staging)) {
-        p.phase = "apply_failed";
-        p.detail = "staging 目录不存在";
-        write_pending(p);
-        return "UPDATE 失败：暂存目录不见了（" + p.staging + "）";
-    }
-
-    std::vector<std::string> todo;
-    int skipped = 0;
-    for (const auto& rel : p.files) {
-        if (is_protected_rel(rel)) { ++skipped; continue; }
-        if (!path_exists(join_path(p.staging, rel))) continue;
-        todo.push_back(rel);
-    }
-    if (todo.empty()) {
-        p.phase = "apply_failed";
-        p.detail = "可安装文件为 0";
-        write_pending(p);
-        return "UPDATE 失败：暂存里没有可安装的文件";
-    }
-
-    const std::string bak = backup_dir(p.version);
-    if (!ensure_dir(bak)) return "UPDATE 失败：无法创建备份目录（" + bak + "）";
-
-    p.applied.clear();
-    p.added.clear();
-    auto abort = [&](const std::string& why) -> std::string {
-        // 立刻按已做的记录回滚，绝不留半新半旧
-        for (auto it = p.applied.rbegin(); it != p.applied.rend(); ++it) {
-            const std::string tgt = join_path(inst, *it);
-            const std::string b = join_path(bak, *it);
-            ::DeleteFileW(rta::platform::from_utf8(tgt).c_str());
-            if (path_exists(b)) move_file(b, tgt);
-        }
-        for (const auto& a : p.added) ::DeleteFileW(rta::platform::from_utf8(join_path(inst, a)).c_str());
-        p.phase = "apply_failed";
-        p.detail = why;
-        write_pending(p);
-        return "UPDATE 失败并已回滚：" + why;
-    };
-
-    for (const auto& rel : todo) {
-        const std::string tgt = join_path(inst, rel);
-        const std::string src = join_path(p.staging, rel);
-        const size_t sp = tgt.find_last_of('\\');
-        if (sp != std::string::npos) {
-            if (!ensure_dir(tgt.substr(0, sp))) return abort("无法创建目录 " + tgt.substr(0, sp));
-        }
-        const bool existed = path_exists(tgt);
-        if (existed) {
-            const std::string b = join_path(bak, rel);
-            const size_t bs = b.find_last_of('\\');
-            if (bs != std::string::npos) ensure_dir(b.substr(0, bs));
-            ::DeleteFileW(rta::platform::from_utf8(b).c_str());
-            if (!move_file(tgt, b)) return abort("备份失败：" + rel);
-        }
-        if (!move_file(src, tgt)) return abort("安装失败：" + rel);
-        p.applied.push_back(rel);
-        if (!existed) p.added.push_back(rel);
-    }
-
-    p.phase = "applied";
-    p.time = now_text();
-    p.detail = "替换 " + std::to_string(p.applied.size()) + " 个文件，跳过受保护 " + std::to_string(skipped) + " 个";
-    write_pending(p);
-    return "UPDATE 已替换 " + std::to_string(p.applied.size()) + " 个文件（跳过受保护 " +
-           std::to_string(skipped) + " 个），备份在 " + bak;
+    if (!p.exists || (p.phase != "applied" && p.phase != "applying" && p.phase != "rollback_failed")) return {};
+    InstallRuntimeGuard runtime(install_dir(), true);
+    if (!runtime.ok()) return "UPDATE 恢复暂缓：" + runtime.error();
+    std::string runningError;
+    if (install_has_running_server(install_dir(), runningError)) return "UPDATE 恢复暂缓：" + runningError;
+    std::string detail = why;
+    const bool restored = rollback_files(p, detail);
+    p.phase = restored ? "rolled_back" : "rollback_failed";
+    p.time = now_text(); p.detail = detail;
+    if (!write_pending(p)) return "UPDATE 恢复结果无法写入台账（保留原台账与备份）：" + detail;
+    return std::string(restored ? "UPDATE 已回滚：" : "UPDATE 回滚失败：") + detail;
 }
 
-// ===========================================================================
-// 4. 回滚（启动器发现新版本起不来时调用）
-// ===========================================================================
-inline std::string rollback_pending(const std::string& why) {
+inline std::string apply_pending_on_startup() {
+    std::string leaseError; UpdateWriterLease writer(leaseError);
+    if (!writer.owns_lock()) return "UPDATE 未执行：" + leaseError;
     PendingPlan p = read_pending();
-    if (!p.exists || p.phase != "applied") return std::string();
-    const std::string inst = install_dir();
-    const std::string bak = backup_dir(p.version);
-    int restored = 0, removed = 0, failed = 0;
-    for (auto it = p.applied.rbegin(); it != p.applied.rend(); ++it) {
-        const std::string tgt = join_path(inst, *it);
-        const std::string b = join_path(bak, *it);
-        ::DeleteFileW(rta::platform::from_utf8(tgt).c_str());
-        if (path_exists(b)) { if (move_file(b, tgt)) ++restored; else ++failed; }
+    if (!p.exists) return {};
+    if (p.phase == "applying" || p.phase == "rollback_failed")
+        return rollback_pending("恢复中断的更新事务");
+    if (p.phase != "ready") return {};
+    auto reject = [&](const std::string& why) {
+        p.phase = "apply_failed"; p.detail = why;
+        const bool saved = write_pending(p);
+        return "UPDATE 失败（未替换文件）：" + why + (saved ? "" : "；无法写入失败台账");
+    };
+    InstallRuntimeGuard runtime(install_dir(), true);
+    if (!runtime.ok()) return "UPDATE 暂缓：" + runtime.error();
+    std::string runningError;
+    if (install_has_running_server(install_dir(), runningError)) return "UPDATE 暂缓：" + runningError;
+    StagingManifest manifest; std::string error;
+    if (!verify_staging(p.version, p.staging, manifest, error)) return reject(error);
+    if (p.manifestSha != sha256_hex(read_text_file(staging_manifest_path(p.version)))) return reject("安装计划的完整清单身份已改变");
+    std::vector<std::string> expected;
+    for (const auto& e : manifest.files) if (e.staged) expected.push_back(e.file.path);
+    if (p.files != expected) return reject("安装计划与完整清单不一致");
+    const std::string inst = install_dir(), bak = backup_dir(p.version);
+    // A previous backup is recovery material, never silently overwrite it.
+    if (is_dir(bak) && count_files(bak) != 0) return reject("备份目录已有文件，需先处理上次更新材料");
+    if (!ensure_dir(bak)) return reject("无法创建备份目录");
+    std::vector<std::string> todo;
+    for (const auto& rel : expected) if (!is_protected_rel(rel)) todo.push_back(rel);
+    if (todo.empty()) return reject("可安装文件为 0");
+    p.phase = "applying"; p.applied.clear(); p.added.clear(); p.originalSha.clear();
+    if (!write_pending(p)) return "UPDATE 失败：无法持久化事务，未替换文件";
+    auto abort = [&](const std::string& why) {
+        std::string detail = why;
+        const bool restored = rollback_files(p, detail);
+        p.phase = restored ? "rolled_back" : "rollback_failed";
+        p.detail = detail;
+        const bool saved = write_pending(p);
+        return std::string(restored ? "UPDATE 失败并已回滚：" : "UPDATE 失败且回滚未完成：") +
+            detail + (saved ? "" : "；无法写入恢复结果，保留原事务台账");
+    };
+    for (const auto& rel : todo) {
+        const std::string tgt = join_path(inst, rel), src = join_path(p.staging, rel), b = join_path(bak, rel);
+        const size_t sp = tgt.find_last_of("\\/");
+        if (sp != std::string::npos && !ensure_dir(tgt.substr(0, sp))) return abort("无法创建安装目录：" + rel);
+        const bool existed = path_exists(tgt);
+        if (existed) {
+            const size_t bs = b.find_last_of("\\/");
+            if (bs != std::string::npos && !ensure_dir(b.substr(0, bs))) return abort("无法创建备份目录：" + rel);
+        }
+        if (existed) {
+            std::string hex, hashError;
+            if (!sha256_file(tgt, hex, hashError)) return abort("无法记录旧文件摘要：" + rel);
+            p.originalSha[rel] = hex;
+        }
+        // Write-ahead intent covers failures before backup, between backup/install,
+        // after install, and even an interrupted write of the next journal update.
+        p.applied.push_back(rel);
+        if (!existed) p.added.push_back(rel);
+        if (!write_pending(p)) return abort("无法记录文件事务：" + rel);
+        if (existed && !move_file(tgt, b)) return abort("备份失败：" + rel);
+        if (!move_file(src, tgt)) return abort("安装失败：" + rel);
     }
-    for (const auto& a : p.added) {
-        const std::string t = join_path(inst, a);
-        if (path_exists(t) && ::DeleteFileW(rta::platform::from_utf8(t).c_str())) ++removed;
-    }
-    p.phase = "rolled_back";
-    p.time = now_text();
-    p.detail = why + "（恢复 " + std::to_string(restored) + " 个 / 删除新增 " +
-               std::to_string(removed) + " 个 / 失败 " + std::to_string(failed) + " 个）";
-    write_pending(p);
-    return "UPDATE 已回滚：" + p.detail;
+    p.phase = "applied"; p.time = now_text();
+    p.detail = "替换 " + std::to_string(todo.size()) + " 个文件";
+    if (!write_pending(p)) return abort("无法记录安装完成状态");
+    return "UPDATE 已替换 " + std::to_string(todo.size()) + " 个文件，备份在 " + bak;
 }
 
 // ===========================================================================
 // 5. 确认（新 rtaweb 启动时调用）
 // ===========================================================================
 inline std::string confirm_on_startup() {
+    std::string leaseError; UpdateWriterLease writer(leaseError);
+    if (!writer.owns_lock()) return "UPDATE 未执行：" + leaseError;
     PendingPlan p = read_pending();
     if (!p.exists) return std::string();
     if (p.phase == "applied") {
         if (cmp_versions(p.version, current_version()) == 0) {
             p.phase = "done";
             p.time = now_text();
-            write_pending(p);
+            if (!write_pending(p)) return "UPDATE 确认失败：无法写入完成台账，保留暂存与备份";
             // 成功之后 staging 可以清；backup 保留（用户想手工回退还有料）
             rmtree(join_path(version_dir(p.version), "staging"));
             return "UPDATE ok " + p.from + " -> " + p.version + "（" + p.detail + "）";
@@ -331,7 +374,8 @@ inline std::string confirm_on_startup() {
                " —— 换文件可能没落到本目录";
     }
     if (p.phase == "rolled_back") return "UPDATE 上次更新失败已回滚：" + p.detail;
-    if (p.phase == "apply_failed") return "UPDATE 上次替换失败已回滚：" + p.detail;
+    if (p.phase == "apply_failed") return "UPDATE 上次更新被拒绝（未替换文件）：" + p.detail;
+    if (p.phase == "rollback_failed" || p.phase == "applying") return "UPDATE 更新事务未完成，保留备份等待恢复：" + p.detail;
     if (p.phase == "ready") return "UPDATE 有已下载但尚未安装的更新（重启后生效）";
     return std::string();
 }

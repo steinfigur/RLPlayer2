@@ -17,6 +17,7 @@
 #pragma once
 #include <algorithm>
 #include <cstdint>
+#include <bit>
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
@@ -92,7 +93,7 @@ struct DsdStream {
     // 互斥性自检：每个样本必须是 +1 或 -1（1-bit 流只有这两种取值）
     long long ones() const {
         long long n = 0;
-        for (const auto& ch : data) for (uint8_t b : ch) n += __builtin_popcount(b);
+        for (const auto& ch : data) for (uint8_t b : ch) n += std::popcount(b);
         return n;
     }
 };
@@ -218,7 +219,7 @@ inline DsdStream read_dsf(const std::string& path) {
         throw std::runtime_error("DSF 缺少 fmt 块或文件被截断");
 
     const uint64_t fmtSize = rdl64(f.data() + fmtOff + 4);
-    if (fmtSize < 52)
+    if (fmtSize < 52 || fmtSize > f.size() - fmtOff)
         throw std::runtime_error("DSF fmt 块长度异常（" + std::to_string(fmtSize) + "）");
 
     const uint8_t* b = f.data() + fmtOff + 12;
@@ -261,9 +262,9 @@ inline DsdStream read_dsf(const std::string& path) {
         off += (size_t)sz;
     }
     if (!dataPtr) throw std::runtime_error("DSF 缺少 data 块");
-    if (dataSize < (uint64_t)chNum * 8) throw std::runtime_error("DSF data 块过短");
 
-    const uint64_t needBytes = (sampleCnt + 7) / 8;         // 每声道字节数
+    const uint64_t needBytes = (sampleCnt / 8 + (sampleCnt % 8 != 0));         // 每声道字节数
+    if (needBytes > dataSize / chNum) throw std::runtime_error("DSF 声明有效数据超出 data 块");
     const uint64_t fullBlocks = needBytes / blockSize;
     const uint64_t remBytes   = needBytes % blockSize;
     const uint64_t needData   = (fullBlocks + (remBytes ? 1 : 0)) * (uint64_t)chNum * blockSize;
@@ -313,7 +314,8 @@ inline DsdStream read_dff(const std::string& path) {
         throw std::runtime_error("DFF 的 form type 不是 \"DSD \"（不支持 DST 或其它容器）");
 
     const uint64_t frm8Size = rdb64(f.data() + 4);
-    const size_t end = std::min<size_t>(f.size(), (size_t)(12 + frm8Size));
+    if (frm8Size < 4 || frm8Size > f.size() - 12) throw std::runtime_error("DFF FRM8 块被截断");
+    const size_t end = (size_t)(12 + frm8Size);
 
     uint32_t rate = 0;
     uint32_t declaredCh = 0;
@@ -331,7 +333,7 @@ inline DsdStream read_dff(const std::string& path) {
         while (q + 12 <= pe) {
             const uint64_t ss = rdb64(f.data() + q + 4);
             const uint8_t* body = f.data() + q + 12;
-            if (q + 12 + ss > pe) break;
+            if (ss > pe - q - 12) throw std::runtime_error("DFF PROP 子块被截断");
             if (std::memcmp(f.data() + q, "FS  ", 4) == 0 && ss >= 4) {
                 rate = rdb32(body);
             } else if (std::memcmp(f.data() + q, "CHNL", 4) == 0 && ss >= 2) {
@@ -391,8 +393,11 @@ inline DsdStream read_dff(const std::string& path) {
     s.channelIds = ids.size() == (size_t)ch ? ids : dsf_channel_ids((int)ch);
     s.bits = perCh * 8;
     s.data.assign((size_t)ch, {});
-    for (uint32_t c = 0; c < ch; ++c)
-        s.data[(size_t)c].assign(dataPtr + (size_t)c * perCh, dataPtr + (size_t)(c + 1) * perCh);
+    for (uint32_t c = 0; c < ch; ++c) {
+        auto& dst = s.data[(size_t)c];
+        dst.resize((size_t)perCh);
+        for (size_t n = 0; n < (size_t)perCh; ++n) dst[n] = dataPtr[n * ch + c];
+    }
     return s;
 }
 
@@ -548,7 +553,7 @@ inline void write_dsf(const std::string& path, const DsdStream& s, uint32_t bloc
     write_file_bytes(path, o);
 }
 
-// DFF：大端，按声道连续存放，MSB-first 直通。
+// DFF：大端，按声道逐字节交错存放，MSB-first 直通。
 inline void write_dff(const std::string& path, const DsdStream& s) {
     using namespace dsd_detail;
     if (s.channels < 1 || s.channels > 8) throw std::runtime_error("write_dff: 声道数非法");
@@ -597,6 +602,7 @@ inline void write_dff(const std::string& path, const DsdStream& s) {
     // CMPR：类型 "DSD " + 名称 "not compressed"（补空到偶数）
     std::vector<uint8_t> cmprBody = { 'D', 'S', 'D', ' ' };
     const char* name = "not compressed";
+    cmprBody.push_back((uint8_t)std::strlen(name));
     for (size_t i = 0; name[i]; ++i) cmprBody.push_back((uint8_t)name[i]);
     if (cmprBody.size() & 1) cmprBody.push_back(0);
     cmp = chunk("CMPR", cmprBody);
@@ -605,8 +611,8 @@ inline void write_dff(const std::string& path, const DsdStream& s) {
     const auto propChunk = chunk("PROP", propFmt);
     std::vector<uint8_t> dsd;
     dsd.reserve((size_t)(bytesPerCh * (uint64_t)s.channels));
-    for (int c = 0; c < s.channels; ++c)
-        dsd.insert(dsd.end(), s.data[(size_t)c].begin(), s.data[(size_t)c].begin() + (long long)bytesPerCh);
+    for (uint64_t n = 0; n < bytesPerCh; ++n)
+        for (int c = 0; c < s.channels; ++c) dsd.push_back(s.data[(size_t)c][(size_t)n]);
     const auto dsdChunk = chunk("DSD ", dsd);
 
     std::vector<uint8_t> out;

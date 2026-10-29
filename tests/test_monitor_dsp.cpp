@@ -332,8 +332,7 @@ void test_no_startup_blast() {
     check(out.size() == 4800 * (size_t)ch && peak == 0.0,
           fmt("第一块输出帧数 %zu、峰值 %.3g（必须逐样本 0）", out.size() / ch, peak));
 
-    // 判据自证（铁律 3）：关掉预跑就必须漏音 —— 否则上面那条"峰值 0"可能只是
-    // 因为测试根本没喂进满幅信号，而不是防爆音真的生效。
+    // Volume safety is a Pipeline initialization contract, independent of pre-roll.
     mc.primeMs = 0.0;
     rta::audio::MonitorDspChain raw;
     check(raw.configure(mc, &err), "对照组 configure()（关掉预跑）");
@@ -341,8 +340,16 @@ void test_no_startup_blast() {
     raw.process(in.data(), 4800, outRaw);
     double peakRaw = 0.0;
     for (float v : outRaw) peakRaw = std::max(peakRaw, (double)std::fabs(v));
-    check(peakRaw > 0.5,
-          fmt("对照组（primeMs=0）第一块峰值 %.3f（应明显 > 0.5，证明该漏音真实存在）", peakRaw));
+    check(outRaw.size() == 4800 * (size_t)ch && peakRaw == 0.0,
+          fmt("primeMs=0 第一块峰值 %.3f（仍必须为0）", peakRaw));
+    mc.volumeDb = 0.0;
+    rta::audio::MonitorDspChain audible;
+    check(audible.configure(mc, &err), "非静音对照 configure()");
+    std::vector<float> control;
+    audible.process(in.data(), 4800, control);
+    double controlPeak=0.0;
+    for(float v:control) controlPeak=std::max(controlPeak,(double)std::fabs(v));
+    check(controlPeak > 0.5, "同一输入在0dB对照中产生预期非零输出");
 }
 
 } // namespace

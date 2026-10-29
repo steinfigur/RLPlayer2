@@ -186,6 +186,9 @@ public:
     }
 
     int order() const { return order_; }
+    bool adds_dither_or_shaping() const {
+        return order_ > 0 || s_ == Shaper::RPDF || s_ == Shaper::TPDF || s_ == Shaper::Gauss1;
+    }
     double step() const { return q_; }
     double sample_rate() const { return fs_; }
     double radius() const { return radius_; }

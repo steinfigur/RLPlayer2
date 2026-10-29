@@ -194,6 +194,8 @@ public:
             }
         }
 
+        linearDelay_ = (double)(proto.size() - 1) / (2.0 * (double)L_);
+
         // 关键：有理 L/M 转换中，"内插 -> 滤波 -> 抽取"要求原型在内插域的直流增益为 L，
         // 否则输出会被整体衰减 L 倍（L=1280 时正好 -62.1 dB，实测确认过这个陷阱）。
         // 等价说法：每一相位的抽头之和必须为 1。
@@ -248,11 +250,16 @@ public:
     int  upFactor() const { return L_; }
     int  downFactor() const { return M_; }
 
-    // 群延迟（输入样本数）。原型长度是 T_*L_（偶数 ⟹ Type II 线性相位），
-    // 其在内插域的群延迟为 (T_*L_ - 1)/2，换算回输入样本需再除以 L_。
-    // 曾用 (T_-1)/2，在 L=4 时偏差 3.5 个输出样本 ⟹ 997 Hz 上约 7° 相位误差，
-    // 会让"与理想正弦比对"的残差虚高到 −26 dBFS。
-    double latencyInputSamples() const { return ((double)T_ * (double)L_ - 1.0) / (2.0 * (double)L_); }
+    // Removable algorithm delay in input samples. Use the actually designed
+    // prototype length (Kaiser may round to odd), and compose both stages.
+    // Minimum/intermediate phase has no constant group delay to remove: its
+    // causal phase response is retained as part of the selected filter effect.
+    double latencyInputSamples() const {
+        if (stage1_) return stage1_->latencyInputSamples() + stage2_->latencyInputSamples() *
+            1.0 / (double)stage1_->upFactor();
+        if (passthrough_ || cfg_.phase != PhaseKind::Linear) return 0.0;
+        return linearDelay_;
+    }
 
     // 处理一块输入。out 必须至少有 maxOutFrames(inFrames) 容量。
     // in/out 为每声道指针数组。
@@ -365,6 +372,7 @@ public:
 private:
     ResamplerConfig cfg_;
     int L_ = 1, M_ = 1, T_ = 0, ch_ = 2;
+    double linearDelay_ = 0.0;
     bool passthrough_ = false;
     // ---- GPU 做多相乘加的桥接 ----
     using GpuResampleFn = int (*)(const double*, int, long long, const double*, int, int,

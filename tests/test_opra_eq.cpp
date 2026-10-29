@@ -20,6 +20,10 @@
 #include <cstdlib>
 #include <algorithm>
 
+#ifndef RTA_TEST_SOURCE_DIR
+#error RTA_TEST_SOURCE_DIR must identify the repository assets for this test.
+#endif
+
 using namespace rta::dsp;
 
 static int fails = 0;
@@ -315,13 +319,11 @@ int main() {
         std::vector<OpraPreset> dummies;
         check(!OpraPreset::parse_presets_json("{broken", dummies, nullptr), "畸变 JSON 传入 parse_presets_json 拒绝");
 
-        // OpraService 初始化与 baseDir/cwd 索引解析
-        bool initOk = OpraService::instance().init();
-        if (!initOk) {
-            initOk = OpraService::instance().init("", "..");
-        }
-        check(initOk, "OpraService 初始化并定位索引成功");
-        check(OpraService::instance().index().size() > 5000, "OpraService 载入轻量索引条目数 > 5000");
+        // Source assets are explicit: CMake may place its build directory anywhere.
+        bool initOk = OpraService::instance().init("", RTA_TEST_SOURCE_DIR);
+        check(initOk, "OpraService 初始化并定位索引成功", RTA_TEST_SOURCE_DIR);
+        check(OpraService::instance().index().size() > 5000, "OpraService 载入轻量索引条目数 > 5000",
+              "实际 " + std::to_string(OpraService::instance().index().size()));
     }
 
     // -----------------------------------------------------------------------

@@ -709,7 +709,9 @@ public:
     // 实时音量微调（相对"播放起点"的差值，单位 dB）。
     // 之所以做成「差值」而不是绝对值：绝对音量在 DSP 里已经带抖动做过一次（音质正确的那条路），
     // 这里只负责拖动滑块时的即时响应。差值为 0 时 gain_=1.0，pack 完全走原路径，逐位不变。
+    void set_dop_mode(bool enabled) { if (dopMode_ != enabled) gain_ = 1.0; dopMode_ = enabled; }
     void set_live_gain_db(double db) {
+        if (dopMode_) return;
         if (db <= -144.0) { gain_ = 0.0; return; }
         gain_ = (db == 0.0) ? 1.0 : std::pow(10.0, db / 20.0);
     }
@@ -928,6 +930,7 @@ private:
     uint32_t rate_ = 0;
     int channels_ = 0, bits_ = 0;
     size_t written_ = 0;
+    bool dopMode_ = false;
     double gain_ = 1.0;          // 1.0 = 未启用微调（逐位原样）
     long long lastPad_ = -1, lastGbHr_ = -999, lastTw_ = -1, lastTotal_ = -1, lastCursor_ = -1;
     long long skips_ = 0;

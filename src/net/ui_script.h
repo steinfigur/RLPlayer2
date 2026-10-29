@@ -205,14 +205,8 @@ function apiGetRaw(u) {
 }
  
 function api(u, body) {
-  return apiRaw(u, body).catch(function (err) {
-    if (err && err.status && err.status >= 400 && err.status < 500) {
-      throw err;
-    }
-    return new Promise(function (res) { setTimeout(res, 200); }).then(function () {
-      return apiRaw(u, body);
-    });
-  });
+  // A lost response does not mean the command failed: POST may already have changed state.
+  return apiRaw(u, body);
 }
 
 function renderPanelError(viewName, retryFn, err) {

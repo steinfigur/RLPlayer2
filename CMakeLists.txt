@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.20)
+cmake_minimum_required(VERSION 3.21)
 project(RLPlayer LANGUAGES CXX)
 
 # ---------------- 分发兼容性基线（2026-10-21 事故：-march=znver5 在 5900X 上 0xC000001D） ----------------
@@ -796,3 +796,53 @@ target_link_libraries(health_fuzz PRIVATE psapi winhttp)
 
 # tools/wv2_shot.cpp 故意不登记：它是一次性取证用的最小 WebView2 宿主，
 # 与产品无关，进构建只会拖慢全量。
+
+# Review regressions use production headers with isolated fixtures and no audio endpoints.
+foreach(name requests request_numeric data_json data_writer data_source data_meta data_health data_library
+             dsp dsp_windows dsp_integrity dsp_ec_numerics web_feedback web_staging web_update update_process web_native)
+  add_executable(test_audit_${name} tests/test_audit_${name}.cpp)
+  target_link_libraries(test_audit_${name} PRIVATE rtadsp)
+  if(MSVC)
+    target_compile_options(test_audit_${name} PRIVATE /UNDEBUG)
+  else()
+    target_compile_options(test_audit_${name} PRIVATE -UNDEBUG)
+  endif()
+  add_test(NAME audit_${name} COMMAND test_audit_${name} "${CMAKE_CURRENT_BINARY_DIR}/audit-fixtures/${name}")
+  set_tests_properties(audit_${name} PROPERTIES TIMEOUT 120)
+endforeach()
+target_include_directories(test_audit_data_source BEFORE PRIVATE "${CMAKE_SOURCE_DIR}/tests/audit_data_mocks")
+target_include_directories(test_audit_data_meta BEFORE PRIVATE "${CMAKE_SOURCE_DIR}/tests/audit_meta_mocks")
+target_link_libraries(test_audit_web_update PRIVATE winhttp ws2_32)
+target_link_libraries(test_audit_web_native PRIVATE ws2_32)
+target_link_libraries(test_audit_web_feedback PRIVATE winhttp psapi user32 shell32)
+target_link_libraries(test_audit_data_health PRIVATE winhttp ws2_32)
+target_link_libraries(test_audit_data_library PRIVATE winhttp ws2_32)
+target_link_libraries(test_audit_dsp_windows PRIVATE ole32 uuid mmdevapi ws2_32)
+
+if(WIN32)
+  add_test(NAME audit_verification_gates COMMAND powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass
+           -File "${CMAKE_SOURCE_DIR}/tests/test_audit_gates.ps1")
+endif()
+find_program(RTA_NODE_EXECUTABLE NAMES node PATHS "C:/Program Files/nodejs")
+if(RTA_NODE_EXECUTABLE)
+  add_test(NAME audit_app COMMAND "${RTA_NODE_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_audit_app.js" "$<TARGET_FILE_DIR:rtaweb>" "${CMAKE_BINARY_DIR}/audit-app")
+  set_tests_properties(audit_app PROPERTIES TIMEOUT 150)
+  add_test(NAME audit_api_retry COMMAND "${RTA_NODE_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_audit_api_retry.js")
+else()
+  message(WARNING "node not found: audit_api_retry must run before delivery")
+endif()
+
+add_executable(test_audit_web_lifecycle tests/test_audit_web_lifecycle.cpp)
+target_include_directories(test_audit_web_lifecycle BEFORE PRIVATE "${CMAKE_SOURCE_DIR}/tests/audit_web_mock" "${CMAKE_SOURCE_DIR}/src")
+if(MSVC)
+  target_compile_options(test_audit_web_lifecycle PRIVATE /UNDEBUG)
+else()
+  target_compile_options(test_audit_web_lifecycle PRIVATE -UNDEBUG)
+endif()
+add_test(NAME audit_web_lifecycle COMMAND test_audit_web_lifecycle)
+set_tests_properties(audit_web_lifecycle PROPERTIES TIMEOUT 60)
+
+add_test(NAME audit_capture_offline COMMAND test_capture --offline)
+
+# Resource-dependent tests must support an out-of-tree build directory.
+target_compile_definitions(test_opra_eq PRIVATE RTA_TEST_SOURCE_DIR="${CMAKE_SOURCE_DIR}")

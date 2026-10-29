@@ -114,6 +114,34 @@ struct WavHeaderInfo {
 //   > 0: 成功解析并定位到 data 块起始，返回值即 headerBytes
 //     0: 数据不足，需要更多字节
 //   < 0: 格式非法（非 RIFF、缺少 fmt/data、不支持的编码或位深等）
+// Shared container contract for buffered and streamed WAV decoding.
+inline std::string validate_wav_format(const uint8_t* body, size_t sz) {
+    if (sz < 16) return "WAV fmt 块过短";
+    uint16_t tag = detail::rd16(body), ch = detail::rd16(body + 2);
+    const uint16_t bits = detail::rd16(body + 14);
+    if (tag == 0xFFFE) {
+        static constexpr uint8_t suffix[12] = {0,0,0x10,0,0x80,0,0,0xaa,0,0x38,0x9b,0x71};
+        if (sz < 40 || detail::rd16(body + 16) < 22 ||
+            detail::rd16(body + 26) != 0 || std::memcmp(body + 28, suffix, 12) != 0)
+            return "WAV extensible GUID/扩展头非法";
+        const uint16_t valid = detail::rd16(body + 18);
+        if (valid > bits) return "WAV 有效位数超过容器位深";
+        tag = detail::rd16(body + 24);
+    }
+    if (tag != 1 && tag != 3) return "WAV 编码不是线性 PCM 或 IEEE float (fmtTag=" + std::to_string(tag) + ")";
+    if (tag == 3 && bits == 64) return "float64 WAV 不支持（读取管线使用 float32 位型）";
+    if ((tag == 3 && bits != 32) ||
+        (tag == 1 && bits != 8 && bits != 16 && bits != 24 && bits != 32))
+        return "WAV 位深与编码不匹配 (fmtTag=" + std::to_string(tag) + ", bps=" + std::to_string(bits) + ")";
+    if (ch < 1 || ch > 32) return "WAV 声道数非法 (ch=" + std::to_string(ch) + ")";
+    const uint32_t rate = detail::rd32(body + 4);
+    if (!rate || rate > 4000000u) return "WAV 采样率非法 (rate=" + std::to_string(rate) + ")";
+    const uint32_t align = (uint32_t)ch * (bits / 8u);
+    if (detail::rd16(body + 12) != align || detail::rd32(body + 8) != rate * align)
+        return "WAV blockAlign/byteRate 与格式不一致";
+    return {};
+}
+
 inline int parse_wav_header(const uint8_t* data, size_t size, WavHeaderInfo& out, std::string* errorMsg = nullptr) {
     if (size < 12) return 0;
     if (std::memcmp(data, "RIFF", 4) != 0 || std::memcmp(data + 8, "WAVE", 4) != 0) {
@@ -143,6 +171,8 @@ inline int parse_wav_header(const uint8_t* data, size_t size, WavHeaderInfo& out
                 return -1;
             }
             const uint8_t* body = data + off + 8;
+            const std::string formatError = validate_wav_format(body, sz);
+            if (!formatError.empty()) { if (errorMsg) *errorMsg = formatError; return -1; }
             fmtTag     = detail::rd16(body);
             ch         = detail::rd16(body + 2);
             rate       = detail::rd32(body + 4);
@@ -179,6 +209,10 @@ inline int parse_wav_header(const uint8_t* data, size_t size, WavHeaderInfo& out
         } else if (std::memcmp(id, "data", 4) == 0) {
             if (!haveFmt) {
                 if (errorMsg) *errorMsg = "WAV 格式非法: data 块出现在 fmt 块之前或缺少 fmt 块";
+                return -1;
+            }
+            if (sz != 0xFFFFFFFFu && sz % blockAlign != 0) {
+                if (errorMsg) *errorMsg = "WAV data 包含不完整的采样帧";
                 return -1;
             }
             out.fmtTag = fmtTag;
@@ -320,6 +354,8 @@ inline AudioBuffer read_wav(const std::string& path) {
         }
         if (!std::memcmp(id, "fmt ", 4)) {
             if (sz >= 16) {
+                const std::string formatError = validate_wav_format(body, sz);
+                if (!formatError.empty()) throw std::runtime_error(formatError + " (" + path + ")");
                 fmtTag = detail::rd16(body);
                 ch     = detail::rd16(body + 2);
                 rate   = detail::rd32(body + 4);
@@ -390,6 +426,8 @@ inline AudioBuffer read_wav(const std::string& path) {
     if (dataLen > avail)
         throw std::runtime_error(ctx("WAV data 块越界(dataLen=" + std::to_string(dataLen) +
                                      " > 块体实际可用=" + std::to_string(avail) + ")"));
+    if (dataLen % ((size_t)bytesPer * ch) != 0)
+        throw std::runtime_error(ctx("WAV data 包含不完整的采样帧"));
     const unsigned long long nS = (unsigned long long)dataLen / (unsigned long long)bytesPer;
     constexpr unsigned long long kMaxSamples = 1ULL << 32;   // 防御上限：防溢出/巨量分配路径
     if (nS > kMaxSamples)

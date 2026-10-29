@@ -24,12 +24,20 @@
 #include <cstdlib>
 #include <cstring>
 #include <cctype>
+#include <memory>
+#include <vector>
+#include <set>
+#include <condition_variable>
+#include <stdexcept>
 
 namespace rta::net {
+
+struct HttpResponseStatus { int code = 200; };
 
 struct HttpRequest {
     std::string method, path, body;
     std::string host;     // Host 头（DNS rebinding 校验用；空 = 客户端没发，按不通过处理）
+    std::shared_ptr<HttpResponseStatus> response = std::make_shared<HttpResponseStatus>();
 };
 
 class WebUi {
@@ -43,13 +51,21 @@ public:
     void stop();
 
 private:
-    void loop();
+    void loop(SOCKET listener);
     void handle(SOCKET c);
     static std::string trim(std::string s) {
         while (!s.empty() && (s.back() == '\r' || s.back() == '\n' || s.back() == ' ')) s.pop_back();
         size_t i = 0; while (i < s.size() && s[i] == ' ') ++i;
         return s.substr(i);
     }
+    static WebUi*& current_worker() { static thread_local WebUi* p = nullptr; return p; }
+    std::mutex lifecycleMtx_;
+    std::mutex socketsMtx_;
+    std::condition_variable workerDone_;
+    std::set<SOCKET> sockets_;
+    struct Worker { std::thread thread; std::shared_ptr<std::atomic<bool>> done; };
+    std::vector<Worker> workers_; // accept thread owns additions; stop joins after accept exits
+    bool wsaStarted_ = false;
     SOCKET listen_ = INVALID_SOCKET;
     uint16_t port_ = 0;
     std::atomic<bool> stop_{true};
@@ -79,6 +95,9 @@ inline std::string http_status_text(int code) {
         case 200: return "OK";
         case 400: return "Bad Request";
         case 403: return "Forbidden";
+        case 404: return "Not Found";
+        case 409: return "Conflict";
+        case 503: return "Service Unavailable";
         case 405: return "Method Not Allowed";
         case 413: return "Payload Too Large";
         case 431: return "Request Header Fields Too Large";
@@ -105,32 +124,50 @@ inline bool webui_host_allowed_impl(const std::string& host, const std::string& 
     return false;
 }
 
-// handler 想把状态行写成 405/4xx 时调它（默认一律 200）。
-// 为什么不用类成员：WebUi 是"每个进程一个实例"的基础设施，而 handler 是自由函数；
-// 用 inline 函数 + 函数内 static（C++11 起线程安全初始化）比暴露 extern WebUi* 更省心。
-inline std::atomic<int>* webui_status_slot() {
-    static std::atomic<int> s{200};
-    return &s;
+// Keep the existing handler ABI, while binding status to its request. Nested dispatch restores
+// the outer response; an exception cannot leave a pointer to a dead request behind.
+inline HttpResponseStatus*& webui_response_context() {
+    static thread_local HttpResponseStatus* response = nullptr;
+    return response;
 }
-inline void webui_set_status(int code) { webui_status_slot()->store(code); }
+class WebUiResponseScope {
+public:
+    explicit WebUiResponseScope(HttpResponseStatus& response)
+        : previous_(webui_response_context()) { webui_response_context() = &response; }
+    ~WebUiResponseScope() { webui_response_context() = previous_; }
+    WebUiResponseScope(const WebUiResponseScope&) = delete;
+    WebUiResponseScope& operator=(const WebUiResponseScope&) = delete;
+private:
+    HttpResponseStatus* previous_;
+};
+inline void webui_set_status(int code) {
+    if (auto* response = webui_response_context()) response->code = code;
+}
 
 inline bool WebUi::start(uint16_t port, Handler h, bool loopbackOnly) {
+    if (current_worker() == this) return false;
+    stop();
+    std::lock_guard<std::mutex> lifecycle(lifecycleMtx_);
+    std::lock_guard<std::mutex> sockets(socketsMtx_);
     handler_ = std::move(h);
     lan_ = !loopbackOnly;
     WSADATA w;
     if (WSAStartup(MAKEWORD(2, 2), &w) != 0) return false;
+    wsaStarted_ = true;
     listen_ = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (listen_ == INVALID_SOCKET) return false;
+    if (listen_ == INVALID_SOCKET) { WSACleanup(); wsaStarted_ = false; return false; }
     int yes = 1;
     ::setsockopt(listen_, SOL_SOCKET, SO_REUSEADDR, (const char*)&yes, sizeof(yes));
     sockaddr_in a{};
     a.sin_family = AF_INET;
     a.sin_port = htons(port);
     a.sin_addr.s_addr = loopbackOnly ? htonl(INADDR_LOOPBACK) : htonl(INADDR_ANY);
-    if (::bind(listen_, (sockaddr*)&a, sizeof(a)) != 0) { ::closesocket(listen_); listen_ = INVALID_SOCKET; return false; }
-    if (::listen(listen_, 8) != 0) { ::closesocket(listen_); listen_ = INVALID_SOCKET; return false; }
+    if (::bind(listen_, (sockaddr*)&a, sizeof(a)) != 0) { ::closesocket(listen_); listen_ = INVALID_SOCKET; WSACleanup(); wsaStarted_ = false; return false; }
+    if (::listen(listen_, 8) != 0) { ::closesocket(listen_); listen_ = INVALID_SOCKET; WSACleanup(); wsaStarted_ = false; return false; }
     sockaddr_in got{}; int gl = sizeof(got);
-    ::getsockname(listen_, (sockaddr*)&got, &gl);
+    if (::getsockname(listen_, (sockaddr*)&got, &gl) != 0) {
+        ::closesocket(listen_); listen_ = INVALID_SOCKET; WSACleanup(); wsaStarted_ = false; return false;
+    }
     port_ = ntohs(got.sin_port);
     // Host 白名单（--lan 时的最小防线，见 handle() 的注释）
     allowedHost_ = "127.0.0.1," + std::to_string((unsigned)port_) +
@@ -140,46 +177,71 @@ inline bool WebUi::start(uint16_t port, Handler h, bool loopbackOnly) {
         if (::GetComputerNameA(nb, &nl) && nl > 0) allowedHost_ += std::string(",") + nb;
     }
     stop_.store(false);
-    thread_ = std::thread([this] { loop(); });
+    try { thread_ = std::thread([this, listener = listen_] { loop(listener); }); }
+    catch (...) { stop_.store(true); ::closesocket(listen_); listen_ = INVALID_SOCKET; WSACleanup(); wsaStarted_ = false; return false; }
     return true;
 }
 
 inline void WebUi::stop() {
     stop_.store(true);
-    // 2026-10-25（移植自协作者 mac 分支 7799e09）：先 shutdown 再 close —— 阻塞在 accept 上的线程
-    // 只有 shutdown 才能确定性地唤醒（close 唤醒是平台相关的"可能"）。签名换 SD_BOTH 让 accept 立刻返回。
-    if (listen_ != INVALID_SOCKET) { ::shutdown(listen_, SD_BOTH); ::closesocket(listen_); listen_ = INVALID_SOCKET; }
+    {
+        std::lock_guard<std::mutex> sockets(socketsMtx_);
+        if (listen_ != INVALID_SOCKET) {
+            ::shutdown(listen_, SD_BOTH);
+            ::closesocket(listen_);
+            listen_ = INVALID_SOCKET;
+        }
+        for (SOCKET c : sockets_) ::shutdown(c, SD_BOTH);
+    }
+    workerDone_.notify_all();
+    // A handler may request shutdown, but cannot join itself. Its owner must call stop
+    // (or destroy WebUi) from outside the handler before releasing captured state.
+    if (current_worker() == this) return;
+    std::lock_guard<std::mutex> lifecycle(lifecycleMtx_);
     if (thread_.joinable()) thread_.join();
-    WSACleanup();
+    for (auto& worker : workers_) if (worker.thread.joinable()) worker.thread.join();
+    workers_.clear();
+    if (wsaStarted_) { WSACleanup(); wsaStarted_ = false; }
 }
 
-// 2026-10-26（261026-02 #3「加载失败，网络异常或服务响应超时」的根因）：
-// 以前是**单线程串行 handle()**，而浏览器打开一页要并发几十张封面/头像。
-// 实测：首张封面 152 ms、连取 20 张 2156 ms ⟹ 一次列表页会把后面的 /api/lib/album 请求
-// 挤到客户端 8 s 超时之外，界面就报「加载失败」。
-// 现在改成**有上限的并发**：最多 kMaxWorkers 个连接并行处理，超出的仍回落到本线程串行处理。
-// 线程安全前提（已核对）：handler 内部对播放状态(ps.mtx)、库(mtx_)、日志(g_logMx)、
-// 索引写盘都持锁；webui 自己的状态只剩 listen_/stop_，只在 start/stop 里动。
 static constexpr int kMaxWorkers = 6;
 
-inline void WebUi::loop() {
-    // 用 shared_ptr 持有计数：worker 是 detached 的，loop() 退出后它可能还在跑，
-    // 按引用捕获会变成悬垂引用（这类崩溃以前踩过一次，不能再犯）。
-    auto active = std::make_shared<std::atomic<int>>(0);
+inline void WebUi::loop(SOCKET listener) {
     while (!stop_.load()) {
-        SOCKET c = ::accept(listen_, nullptr, nullptr);
+        SOCKET c = ::accept(listener, nullptr, nullptr);
         if (c == INVALID_SOCKET) { if (stop_.load()) break; continue; }
-        if (active->load() < kMaxWorkers) {
-            active->fetch_add(1);
-            std::thread([this, c, active] {
-                handle(c);
-                ::closesocket(c);
-                active->fetch_sub(1);
-            }).detach();
-            continue;
+        {
+            std::unique_lock<std::mutex> sockets(socketsMtx_);
+            workerDone_.wait(sockets, [&] { return stop_.load() || sockets_.size() < kMaxWorkers; });
+            if (stop_.load()) { ::closesocket(c); break; }
+            sockets_.insert(c);
         }
-        handle(c);
-        ::closesocket(c);
+        for (auto it = workers_.begin(); it != workers_.end();) {
+            if (it->done->load()) { it->thread.join(); it = workers_.erase(it); }
+            else ++it;
+        }
+        auto done = std::make_shared<std::atomic<bool>>(false);
+        try {
+            workers_.push_back(Worker{});
+            workers_.back().done = done;
+            workers_.back().thread = std::thread([this, c, done] {
+                current_worker() = this;
+                try { handle(c); } catch (...) { std::fputs("WebUi: response construction failed; closing connection\n", stderr); }
+                {
+                    std::lock_guard<std::mutex> sockets(socketsMtx_);
+                    sockets_.erase(c);
+                    ::closesocket(c);
+                }
+                current_worker() = nullptr;
+                done->store(true);
+                workerDone_.notify_all();
+            });
+        } catch (...) {
+            if (!workers_.empty() && !workers_.back().thread.joinable()) workers_.pop_back();
+            std::lock_guard<std::mutex> sockets(socketsMtx_);
+            sockets_.erase(c);
+            ::closesocket(c);
+        }
     }
 }
 
@@ -245,7 +307,9 @@ inline void WebUi::handle(SOCKET c) {
                 if (!line.empty() && line.back() == '\r') line.pop_back();
                 const size_t colon = line.find(':');
                 if (colon == std::string::npos) continue;
-                if (trim(line.substr(0, colon)) == "Host") { req.host = trim(line.substr(colon + 1)); break; }
+                std::string name = trim(line.substr(0, colon));
+                for (char& ch : name) ch = (char)std::tolower((unsigned char)ch);
+                if (name == "host") { req.host = trim(line.substr(colon + 1)); break; }
             }
         }
         // ---- Content-Length：**先判上限再分配** ----
@@ -299,9 +363,13 @@ inline void WebUi::handle(SOCKET c) {
             } else {
                 body.resize(want);
                 req.body.swap(body);
-                webui_status_slot()->store(200);      // 每次请求前复位（handler 可能提前 return）
-                payload = handler_ ? handler_(req, ctype) : std::string("{}");
-                status = webui_status_slot()->exchange(200);
+                WebUiResponseScope response(*req.response);
+                try {
+                    payload = handler_ ? handler_(req, ctype) : std::string("{}");
+                    status = req.response->code;
+                } catch (...) {
+                    fail(500, "请求处理失败");
+                }
             }
         }
     }

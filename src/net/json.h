@@ -1,12 +1,16 @@
-// json.h — 极简 JSON 解析（只读，够用即可）
+// json.h — 严格 JSON 只读解析（错误不返回部分结果）
 //
-// 用途：解析 Subsonic / Emby 的 REST 响应。不追求完备，只覆盖它们实际用到的结构。
+// 用途：REST 响应与持久化缓存。拒绝截断、非法数字、转义及非标 UTF-8。
 #pragma once
 #include <string>
 #include <vector>
 #include <map>
 #include <cstdlib>
 #include <cmath>
+#include <sstream>
+#include <locale>
+#include <limits>
+#include <iomanip>
 
 namespace rta::net {
 
@@ -29,7 +33,17 @@ struct Json {
         return (type == Arr && i < arr.size()) ? arr[i] : nil;
     }
     size_t size() const { return type == Arr ? arr.size() : 0; }
-    std::string s() const { return type == Str ? str : (type == Num ? std::to_string((long long)num) : std::string()); }
+    std::string s() const {
+        if (type == Str) return str;
+        if (type != Num) return {};
+        // Preserve the existing integer/truncation form only while conversion is representable.
+        const double lower = static_cast<double>(std::numeric_limits<long long>::lowest());
+        if (num >= lower && num < -lower) return std::to_string(static_cast<long long>(num));
+        std::ostringstream stream;
+        stream.imbue(std::locale::classic());
+        stream << std::setprecision(std::numeric_limits<double>::max_digits10) << num;
+        return stream.str();
+    }
     double n() const { return type == Num ? num : (type == Str ? atof(str.c_str()) : 0.0); }
     bool ok() const { return type != Null; }
 };
@@ -37,27 +51,54 @@ struct Json {
 class JsonParser {
 public:
     explicit JsonParser(const std::string& s) : s_(s) {}
-    Json parse() { Json j; skip(); if (p_ < s_.size()) value(j); return j; }
+    Json parse() {
+        p_ = 0; error_.clear();
+        Json j;
+        if (!value(j, 0)) return Json{};
+        skip();
+        if (p_ != s_.size()) { fail("trailing data"); return Json{}; }
+        return j;
+    }
+    bool valid() const { return error_.empty(); }
+    const std::string& error() const { return error_; }
+    size_t position() const { return p_; }
 private:
     const std::string& s_;
     size_t p_ = 0;
-
+    std::string error_;
+    bool fail(const char* message) { if (error_.empty()) error_ = message; return false; }
     void skip() {
-        while (p_ < s_.size()) {
-            const char c = s_[p_];
-            if (c == ' ' || c == '\t' || c == '\r' || c == '\n') ++p_;
-            else break;
-        }
+        while (p_ < s_.size() && (s_[p_] == ' ' || s_[p_] == '\t' || s_[p_] == '\r' || s_[p_] == '\n')) ++p_;
     }
     bool eat(char c) { skip(); if (p_ < s_.size() && s_[p_] == c) { ++p_; return true; } return false; }
-
-    void str(std::string& out) {
-        if (!eat('"')) return;
-        out.clear();
+    bool hex4(unsigned& cp) {
+        cp = 0;
+        for (int i = 0; i < 4; ++i) {
+            if (p_ == s_.size()) return fail("truncated unicode escape");
+            const unsigned char c = (unsigned char)s_[p_++];
+            unsigned v;
+            if (c >= '0' && c <= '9') v = c - '0';
+            else if (c >= 'a' && c <= 'f') v = c - 'a' + 10;
+            else if (c >= 'A' && c <= 'F') v = c - 'A' + 10;
+            else return fail("invalid unicode escape");
+            cp = cp * 16 + v;
+        }
+        return true;
+    }
+    static void utf8(std::string& out, unsigned cp) {
+        if (cp < 0x80) out += (char)cp;
+        else if (cp < 0x800) { out += (char)(0xc0 | (cp >> 6)); out += (char)(0x80 | (cp & 63)); }
+        else if (cp < 0x10000) { out += (char)(0xe0 | (cp >> 12)); out += (char)(0x80 | ((cp >> 6) & 63)); out += (char)(0x80 | (cp & 63)); }
+        else { out += (char)(0xf0 | (cp >> 18)); out += (char)(0x80 | ((cp >> 12) & 63)); out += (char)(0x80 | ((cp >> 6) & 63)); out += (char)(0x80 | (cp & 63)); }
+    }
+    bool str(std::string& out) {
+        if (!eat('"')) return fail("expected string");
         while (p_ < s_.size()) {
-            const char c = s_[p_++];
-            if (c == '"') break;
-            if (c == '\\' && p_ < s_.size()) {
+            const unsigned char c = (unsigned char)s_[p_++];
+            if (c == '"') return true;
+            if (c < 0x20) return fail("unescaped control character");
+            if (c == '\\') {
+                if (p_ == s_.size()) return fail("truncated escape");
                 const char e = s_[p_++];
                 switch (e) {
                     case 'n': out += '\n'; break;
@@ -69,69 +110,102 @@ private:
                     case '"': out += '"'; break;
                     case '\\': out += '\\'; break;
                     case 'u': {
-                        if (p_ + 4 <= s_.size()) {
-                            const unsigned cp = (unsigned)strtoul(s_.substr(p_, 4).c_str(), nullptr, 16);
-                            p_ += 4;
-                            // UTF-8 编码（含代理对的简化处理）
-                            if (cp < 0x80) out += (char)cp;
-                            else if (cp < 0x800) { out += (char)(0xC0 | (cp >> 6)); out += (char)(0x80 | (cp & 0x3F)); }
-                            else { out += (char)(0xE0 | (cp >> 12)); out += (char)(0x80 | ((cp >> 6) & 0x3F)); out += (char)(0x80 | (cp & 0x3F)); }
-                        }
-                        break;
+                        unsigned cp;
+                        if (!hex4(cp)) return false;
+                        if (cp >= 0xd800 && cp <= 0xdbff) {
+                            if (p_ + 2 > s_.size() || s_[p_] != '\\' || s_[p_ + 1] != 'u') return fail("missing low surrogate");
+                            p_ += 2;
+                            unsigned low;
+                            if (!hex4(low)) return false;
+                            if (low < 0xdc00 || low > 0xdfff) return fail("invalid low surrogate");
+                            cp = 0x10000 + ((cp - 0xd800) << 10) + low - 0xdc00;
+                        } else if (cp >= 0xdc00 && cp <= 0xdfff) return fail("isolated low surrogate");
+                        utf8(out, cp); break;
                     }
-                    default: out += e;
+                    default: return fail("invalid escape");
                 }
-            } else out += c;
+            } else if (c < 0x80) out += (char)c;
+            else {
+                unsigned cp; int count; unsigned min;
+                if (c >= 0xc2 && c <= 0xdf) { cp = c & 31; count = 1; min = 0x80; }
+                else if (c >= 0xe0 && c <= 0xef) { cp = c & 15; count = 2; min = 0x800; }
+                else if (c >= 0xf0 && c <= 0xf4) { cp = c & 7; count = 3; min = 0x10000; }
+                else return fail("invalid UTF-8");
+                for (int i = 0; i < count; ++i) {
+                    if (p_ == s_.size()) return fail("truncated UTF-8");
+                    const unsigned char cc = (unsigned char)s_[p_++];
+                    if ((cc & 0xc0) != 0x80) return fail("invalid UTF-8 continuation");
+                    cp = (cp << 6) | (cc & 63);
+                }
+                if (cp < min || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff)) return fail("invalid UTF-8 codepoint");
+                utf8(out, cp);
+            }
         }
+        return fail("unterminated string");
     }
-
-    void value(Json& j) {
+    bool digit() const { return p_ < s_.size() && s_[p_] >= '0' && s_[p_] <= '9'; }
+    bool value(Json& j, unsigned depth) {
+        if (depth > 256) return fail("maximum nesting exceeded");
         skip();
-        if (p_ >= s_.size()) return;
+        if (p_ == s_.size()) return fail("expected value");
         const char c = s_[p_];
         if (c == '{') {
             ++p_; j.type = Json::Obj;
-            skip();
-            if (eat('}')) return;
+            if (eat('}')) return true;
             for (;;) {
-                std::string k; skip(); str(k);
-                if (!eat(':')) break;
-                Json v; value(v);
+                std::string k;
+                if (!str(k) || !eat(':')) return fail("expected object colon");
+                Json v; if (!value(v, depth + 1)) return false;
                 j.obj[k] = std::move(v);
-                if (eat(',')) continue;
-                eat('}');
-                break;
+                if (eat('}')) return true;
+                if (!eat(',')) return fail("expected object close or comma");
             }
-        } else if (c == '[') {
-            ++p_; j.type = Json::Arr;
-            skip();
-            if (eat(']')) return;
-            for (;;) {
-                Json v; value(v);
-                j.arr.push_back(std::move(v));
-                if (eat(',')) continue;
-                eat(']');
-                break;
-            }
-        } else if (c == '"') {
-            j.type = Json::Str; str(j.str);
-        } else if (c == 't' || c == 'f') {
-            j.type = Json::Bool;
-            j.b = (c == 't');
-            while (p_ < s_.size() && isalpha((unsigned char)s_[p_])) ++p_;
-        } else if (c == 'n') {
-            j.type = Json::Null;
-            while (p_ < s_.size() && isalpha((unsigned char)s_[p_])) ++p_;
-        } else {
-            j.type = Json::Num;
-            const size_t st = p_;
-            while (p_ < s_.size() && (isdigit((unsigned char)s_[p_]) || s_[p_] == '-' ||
-                                      s_[p_] == '+' || s_[p_] == '.' || s_[p_] == 'e' || s_[p_] == 'E')) ++p_;
-            j.num = atof(s_.substr(st, p_ - st).c_str());
         }
+        if (c == '[') {
+            ++p_; j.type = Json::Arr;
+            if (eat(']')) return true;
+            for (;;) {
+                Json v; if (!value(v, depth + 1)) return false;
+                j.arr.push_back(std::move(v));
+                if (eat(']')) return true;
+                if (!eat(',')) return fail("expected array close or comma");
+            }
+        }
+        if (c == '"') { j.type = Json::Str; return str(j.str); }
+        if (c == 't' || c == 'f' || c == 'n') {
+            const std::string token = c == 't' ? "true" : c == 'f' ? "false" : "null";
+            if (s_.compare(p_, token.size(), token) != 0) return fail("invalid literal");
+            p_ += token.size();
+            j.type = c == 'n' ? Json::Null : Json::Bool; j.b = c == 't';
+            return true;
+        }
+        const size_t start = p_;
+        if (s_[p_] == '-') ++p_;
+        if (!digit()) return fail("expected number");
+        if (s_[p_] == '0') ++p_;
+        else while (digit()) ++p_;
+        if (p_ < s_.size() && s_[p_] == '.') { ++p_; if (!digit()) return fail("expected fraction"); while (digit()) ++p_; }
+        if (p_ < s_.size() && (s_[p_] == 'e' || s_[p_] == 'E')) {
+            ++p_; if (p_ < s_.size() && (s_[p_] == '+' || s_[p_] == '-')) ++p_;
+            if (!digit()) return fail("expected exponent");
+            while (digit()) ++p_;
+        }
+        j.type = Json::Num;
+        const std::string number = s_.substr(start, p_ - start);
+        // Classic locale keeps JSON's decimal point independent of the process locale.
+        std::istringstream stream(number); stream.imbue(std::locale::classic());
+        stream >> j.num;
+        if (stream.fail() || !std::isfinite(j.num)) return fail("number out of range");
+        return true;
     }
 };
 
-inline Json json_parse(const std::string& text) { return JsonParser(text).parse(); }
+inline Json json_parse(const std::string& text, std::string* error = nullptr, size_t* offset = nullptr) {
+    JsonParser parser(text);
+    Json j = parser.parse();
+    if (error) *error = parser.error();
+    if (offset) *offset = parser.position();
+    return j;
+}
 
 } // namespace rta::net

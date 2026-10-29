@@ -616,9 +616,8 @@ struct MonitorDspConfig {
     double   transition     = 0.05;   // 过渡带占比
     bool     useGpuResample = false;  // 监听不依赖 rtagpu.dll（CPU 足够，少一次 DLL 探测）
 
-    // 起流前"预跑"的静音长度（ms）。必须 > 管线的 volumeRampMs（本链固定 50ms）。
-    // 作用见 configure() 里的注释：把音量渐变跑完，避免开麦头 50ms 以 0 dB 漏音。
-    // 0 = 不预跑 —— 只给测试做"判据自证"用，生产永远用默认值。
+    // Optional FIR/PEQ zero pre-roll. Startup volume safety is guaranteed by
+    // Pipeline initialization even when primeMs is zero.
     double   primeMs = 60.0;
 };
 
@@ -705,13 +704,8 @@ public:
             return fail(std::string("监听 DSP 管线构造失败: ") + e.what());
         }
 
-        // ---- 起流防爆音：把音量渐变先跑完 ----
-        // VolumeControl 的 current_ 初值是 1.0（0 dB），set_gain_db() 只会把 target_ 设为
-        // 用户音量并安排一段渐变。监听是"开麦即出声"：若直接开始，头 50ms 会以接近 0 dB
-        // 把采集到的声音送出去 —— 用户听到的是开麦瞬间的一记漏音/爆音。音量设得越低越明显
-        //（增益从 1.0 掉到目标值）。
-        // 这里先喂一段【数字静音】把渐变跑完，输出丢弃：喂的是 0，等价于流从 t=0 开始，
-        // 重采样相位与滤波器历史照常建立，不改变之后的任何样本。
+        // Optional zero pre-roll primes FIR/PEQ histories. Pipeline initializes volume
+        // directly at its requested level, so safety no longer depends on this pre-roll.
         if (cfg_.primeMs > 0.0) {
             const size_t primeFrames =
                 (size_t)std::max(1.0, std::ceil(cfg_.primeMs * (double)cfg_.inRate / 1000.0));
@@ -749,7 +743,7 @@ public:
             rta::audio::AudioBuffer ob = pipe_->process(ib, &st);
             const size_t nOut = ob.frames();
             const int    oc   = ob.channels;
-            if (nOut == 0 || oc <= 0) return 0;
+            if (nOut == 0 || oc <= 0) { inFramesTotal_ += inFrames; return 0; }
 
             const double fscale = ob.fullScale();       // 32-bit → 2^31
             const int    outCh  = cfg_.outChannels;
