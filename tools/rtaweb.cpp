@@ -296,6 +296,13 @@ struct PlayerState {
     void joinIfDone() {
         if (th.joinable()) th.join();
     }
+    // Called by the command owner after joining the previous session. Controls
+    // belong to that session, including requests received while it was idle.
+    void resetControls() {
+        seekReq.store(-1.0);
+        pauseReq.store(false);
+        paused.store(false);
+    }
 };
 static PlayerState g_ps;
 
@@ -10666,6 +10673,13 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         // 播放整张专辑（?k=专辑键&i=起始曲序），队列被换成这张专辑
         if (rta::net::route_matches(rq.path, "/api/lib/play")) {
             PlayParams p = parseForm(rq.body);
+            // This entry owns the local album queue. UPnP has a single-track
+            // transport owner; sending this queue to make_sink would fake playback
+            // through NullSink instead of controlling the selected renderer.
+            if (p.backend == "upnp") {
+                rta::net::webui_set_status(409);
+                return "{\"ok\":false,\"error\":\"UPnP 专辑队列播放尚不支持，请使用单曲投放和手动切歌\"}";
+            }
             std::string key;
             size_t start = 0;
             {
@@ -10702,16 +10716,19 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
                 items[start].cs = p.cueStart;
                 items[start].ce = p.cueEnd;
             }
+            ps.stop.store(true);
+            ps.joinIfDone();
+            ps.resetControls();
+            ps.stop.store(false);
             {
                 std::lock_guard<std::mutex> lk(g_q.mtx);
                 g_q.items = items;
                 g_q.index = start;
+                g_q.base.clear();
+                g_q.sortBase.clear();
             }
             queue_save();
             params_store(p);
-            ps.stop.store(true);
-            ps.joinIfDone();
-            ps.stop.store(false);
             { std::lock_guard<std::mutex> lk(ps.mtx); ps.error.clear(); ps.current = items[start].path; }
             ps.played.store(0);
             ps.total.store(0);
@@ -10737,6 +10754,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
                     g_q.items.emplace_back(t.path, isCue ? cs : -1.0, isCue ? ce : -1.0);
                     ++cnt;
                 }
+                if (cnt) { g_q.base.clear(); g_q.sortBase.clear(); }
                 cnt = g_q.items.size();
             }
             queue_save();
@@ -11436,6 +11454,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         // 先停掉上一次
         ps.stop.store(true);
         ps.joinIfDone();
+        ps.resetControls();
         ps.stop.store(false);
         // 一条会话原则（261024-01 #9）：开始新的本地播放时，停掉可能还在跑的投放会话，
         // 避免本机声卡与网络渲染器同时出声（两套控制互相打架）。
@@ -11463,6 +11482,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
             if (!found) {
                 g_q.items.push_back(want);
                 g_q.index = g_q.items.size() - 1;
+                g_q.base.clear();
                 g_q.sortBase.clear();     // 队列结构变了 ⟹ 排序撤销点作废（与 /api/add 一致）
             }
         }
@@ -11689,7 +11709,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
             std::lock_guard<std::mutex> lk(g_q.mtx);
             for (const auto& f : addList) g_q.items.emplace_back(f);
             // 新加进来的曲目不在旧排序快照里 ⟹ 快照作废（否则"恢复默认顺序"会把它抹掉）。
-            if (!addList.empty()) g_q.sortBase.clear();
+            if (!addList.empty()) { g_q.base.clear(); g_q.sortBase.clear(); }
             cnt = g_q.items.size();
         }
         queue_save();
@@ -12768,6 +12788,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         ct = "application/json; charset=utf-8";
         ps.stop.store(true);
         ps.joinIfDone();
+        ps.resetControls();
         ps.stop.store(false);
         ps.playing.store(false);
         // 清空队列同时结束投放会话（否则渲染器还会继续播上一首）
@@ -12782,6 +12803,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
             std::lock_guard<std::mutex> lk(g_q.mtx);
             g_q.items.clear();
             g_q.index = 0;
+            g_q.base.clear();
             g_q.sortBase.clear();   // 队列空了，排序撤销点也作废
         }
         queue_save();
@@ -12817,6 +12839,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
 
         ps.stop.store(true);
         ps.joinIfDone();
+        ps.resetControls();
         ps.stop.store(false);
 
         PlayParams p = params_snapshot();
@@ -12957,6 +12980,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
             // 避免本机声卡与网络渲染器同时出声；播放器状态交给投放会话接管前先清零。
             ps.stop.store(true);
             ps.joinIfDone();
+            ps.resetControls();
             ps.stop.store(false);
             ps.playing.store(false);
             ps.paused.store(false);
@@ -14916,6 +14940,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         ps.pauseReq.store(false);
         ps.seekReq.store(-1.0);
         ps.joinIfDone();
+        ps.resetControls();
         ps.stop.store(false);
         ps.paused.store(false);
         ps.playing.store(false);

@@ -263,7 +263,9 @@ inline ManifestExt parse_manifest_ext(const std::string& json) {
     if (url_allowed(dl)) {
         m.deltaUrl = dl;
         m.deltaSha = lower_ascii(j["sha256"].s());
-        m.deltaSize = (long long)j["size"].n();
+        if (j.has("size") && !parse_manifest_size(j["size"], m.deltaSize)) {
+            m.error = "清单下载包 size 非法"; return m;
+        }
     }
     const rta::net::Json& full = j["full"];
     if (full.type == rta::net::Json::Obj) {
@@ -271,7 +273,9 @@ inline ManifestExt parse_manifest_ext(const std::string& json) {
         if (url_allowed(fu)) {
             m.fullUrl = fu;
             m.fullSha = lower_ascii(full["sha256"].s());
-            m.fullSize = (long long)full["size"].n();
+            if (full.has("size") && !parse_manifest_size(full["size"], m.fullSize)) {
+                m.error = "清单 full.size 非法"; return m;
+            }
         }
     }
     const std::string fb = j["files_base"].s();
@@ -291,9 +295,7 @@ inline ManifestExt parse_manifest_ext(const std::string& json) {
             ManifestFile f;
             f.path = norm_rel(rawPath);
             f.sha256 = lower_ascii(e["sha256"].s());
-            const double declaredSize = e["size"].n();
-            if (e["size"].type != rta::net::Json::Num || !std::isfinite(declaredSize) || declaredSize < 0 || declaredSize > 9007199254740991.0 || declaredSize != std::floor(declaredSize)) { m.error = "清单文件 size 非法"; return m; }
-            f.size = (long long)declaredSize;
+            if (!parse_manifest_size(e["size"], f.size)) { m.error = "清单文件 size 非法"; return m; }
             if (!safe_install_rel(f.path) || !is_hex64(f.sha256) || !seen.insert(lower_ascii(f.path)).second) {
                 m.error = "清单 files[] 第 " + std::to_string(i + 1) + " 条不合法（路径或 sha256）";
                 return m;

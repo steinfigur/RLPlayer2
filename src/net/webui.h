@@ -29,6 +29,7 @@
 #include <set>
 #include <condition_variable>
 #include <stdexcept>
+#include "net/request_values.h"
 
 namespace rta::net {
 
@@ -277,12 +278,13 @@ inline void WebUi::handle(SOCKET c) {
     };
     size_t hdrEnd = std::string::npos;
     while ((hdrEnd = findHead()) == std::string::npos) {
-        if (buf.size() > kMaxHeadBytes) { tooBig = true; break; }
+        // Up to three delimiter bytes may have arrived without completing CRLFCRLF.
+        if (buf.size() > kMaxHeadBytes + 3) { tooBig = true; break; }
         const int r = ::recv(c, tmp, sizeof(tmp), 0);
         if (r <= 0) break;
         buf.append(tmp, (size_t)r);
     }
-    if (tooBig) {
+    if (tooBig || (hdrEnd != std::string::npos && hdrEnd > kMaxHeadBytes)) {
         fail(431, "请求头过大（>64KB）：URL 或头部超限");
     } else if (hdrEnd == std::string::npos) {
         fail(400, "请求头不完整（超时 500ms 或客户端提前关闭）");
@@ -334,14 +336,14 @@ inline void WebUi::handle(SOCKET c) {
                 if (v.empty() || v.find_first_not_of("0123456789") != std::string::npos) { clBad = true; break; }
                 want = (size_t)strtoull(v.c_str(), nullptr, 10);
                 // 上传端点单独放宽（见 kMaxUploadBytes 注释）
-                const size_t cap = (req.path.rfind("/api/upload", 0) == 0) ? kMaxUploadBytes : kMaxBodyBytes;
+                const size_t cap = route_matches(req.path, "/api/upload") ? kMaxUploadBytes : kMaxBodyBytes;
                 if (want > cap) { clBad = true; break; }
             }
         }
         if (req.method.empty() || req.path.empty()) {
             fail(400, "请求行无法解析");
-        } else if (clBad && want > ((req.path.rfind("/api/upload", 0) == 0) ? kMaxUploadBytes : kMaxBodyBytes)) {
-            fail(413, (req.path.rfind("/api/upload", 0) == 0)
+        } else if (clBad && want > (route_matches(req.path, "/api/upload") ? kMaxUploadBytes : kMaxBodyBytes)) {
+            fail(413, route_matches(req.path, "/api/upload")
                         ? "请求体过大（上传上限 2GB）"
                         : "请求体过大（上限 16MB）");
         } else if (clBad) {

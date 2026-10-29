@@ -19,6 +19,8 @@
 #include "meta/store.h"
 #include "net/http_client.h"
 #include "net/json.h"
+#include <cmath>
+#include <limits>
 
 #include <algorithm>
 #include <chrono>
@@ -342,17 +344,28 @@ inline bool knowledge_from_json(const std::string& text,
         if (err_out) *err_out = "knowledge cache corrupted: not a JSON object";
         return false;
     }
-    entity_id_out = j["entity_id"].s();
-    subject_out = j["subject"].s();
     const rta::net::Json& arr = j["materials"];
     if (arr.type != rta::net::Json::Arr) {
         if (err_out) *err_out = "knowledge cache corrupted: materials is not an array";
         return false;
     }
-    materials_out.clear();
+    std::vector<KnowledgeMaterial> parsed;
     for (size_t i = 0; i < arr.size(); ++i) {
         const rta::net::Json& item = arr.at(i);
         if (item.type != rta::net::Json::Obj) continue;
+        for (const char* key : {"fetched_at", "expires_at", "authority"}) {
+            if (!item.has(key)) continue; // Legacy records use zero for absent metadata.
+            const auto& field = item[key];
+            const double value = field.n();
+            const bool authority = std::string(key) == "authority";
+            const double low = authority ? (double)std::numeric_limits<int>::lowest() : -9007199254740991.0;
+            const double high = authority ? (double)std::numeric_limits<int>::max() : 9007199254740991.0;
+            if (field.type != rta::net::Json::Num || !std::isfinite(value) ||
+                value != std::trunc(value) || value < low || value > high) {
+                if (err_out) *err_out = std::string("knowledge cache corrupted: invalid integer ") + key;
+                return false;
+            }
+        }
         KnowledgeMaterial m;
         m.source     = item["source"].s();
         m.kind       = item["kind"].s();
@@ -365,8 +378,11 @@ inline bool knowledge_from_json(const std::string& text,
         m.expires_at = (long long)item["expires_at"].n();
         m.authority  = (int)item["authority"].n();
         if (m.url.empty()) continue;  // 必带 url，无 url 的材料丢弃
-        materials_out.push_back(std::move(m));
+        parsed.push_back(std::move(m));
     }
+    materials_out = std::move(parsed);
+    entity_id_out = j["entity_id"].s();
+    subject_out = j["subject"].s();
     return true;
 }
 

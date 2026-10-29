@@ -322,6 +322,7 @@ inline void render_loop(OutSink& sink, RenderHost& h) {
     bool   winFirst   = true;           // 第一个窗口是起播斜坡，只作基线不判罚
     bool pausedNow = false;
     bool eos = false;
+    bool producerFailed = false;
     bool padded = false;   // 末尾不足一个周期时只补一次静音（防共享模式无限尾音）
     uint64_t myEpoch = RQ.epoch.load();
 
@@ -394,7 +395,7 @@ inline void render_loop(OutSink& sink, RenderHost& h) {
             if (block) note_pull(nowSec() - pullT0);
             return true;
         }
-        if (RQ.done) eos = true;
+        if (RQ.done) { eos = true; producerFailed = RQ.error; }
         // ★ 丢弃旧块后必须通知生产者：否则它一直卡在"队列满"的 cv.wait 上，
         //   跳转就永远停在原地（本轮实测的真凶）。
         lk.unlock();
@@ -438,7 +439,7 @@ inline void render_loop(OutSink& sink, RenderHost& h) {
                 RQ.q.clear();
             }
             RQ.cv.notify_all();
-            pend.clear(); pendFrames = 0; pendSourceFrames = 0; eos = false; padded = false;
+            pend.clear(); pendFrames = 0; pendSourceFrames = 0; eos = false; producerFailed = false; padded = false;
             played = (size_t)(sk * (double)h.totalOut);
             h.played->store(played);
             timeouts = 0;
@@ -485,7 +486,7 @@ inline void render_loop(OutSink& sink, RenderHost& h) {
             pendFrames = paddedFrames;
             padded = true;
         }
-        if (pendFrames == 0 && eos) { h.normalEnd = true; break; }
+        if (pendFrames == 0 && eos) { h.normalEnd = !producerFailed; break; }
 
         // 事件只当"节奏提示"，不作为写入的前提。
         // 独占流一旦因为短暂没有数据而停发事件，纯事件驱动的写入循环就会永久卡死

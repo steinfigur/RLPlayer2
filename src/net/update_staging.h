@@ -1,11 +1,22 @@
 // Persisted completion contract shared by download, restart recovery and apply.
 #pragma once
 #include <functional>
+#include <cmath>
 #include <set>
 #include "net/update_check.h"
 
 namespace rta::update {
 struct ManifestFile { std::string path, sha256; long long size = 0; };
+
+// JSON numbers use double storage. Every manifest byte count must be an exact,
+// nonnegative integer before narrowing, including optional archive sizes.
+inline bool parse_manifest_size(const rta::net::Json& value, long long& size) {
+    const double number = value.n();
+    if (value.type != rta::net::Json::Num || !std::isfinite(number) || number < 0 ||
+        number > 9007199254740991.0 || number != std::floor(number)) return false;
+    size = (long long)number;
+    return true;
+}
 
 inline std::string norm_rel(std::string p) {
     for (char& c : p) if (c == '/') c = '\\';
@@ -63,14 +74,12 @@ inline bool parse_staging_manifest(const std::string& text, StagingManifest& out
     std::set<std::string> seen;
     for (const auto& e : j["files"].arr) {
         StagingFile f; f.file.path = e["path"].s(); f.file.sha256 = e["sha256"].s();
-        const double size = e["size"].n();
         if (!safe_install_rel(f.file.path) || !is_hex64(f.file.sha256) ||
-            e["size"].type != rta::net::Json::Num || size < 0 || size > 9007199254740991.0 ||
-            size != std::floor(size) || e["staged"].type != rta::net::Json::Bool ||
+            !parse_manifest_size(e["size"], f.file.size) || e["staged"].type != rta::net::Json::Bool ||
             !seen.insert(detail::lower(norm_rel(f.file.path))).second) {
             err = "暂存完成清单文件条目非法或重复"; return false;
         }
-        f.file.path = norm_rel(f.file.path); f.file.size = (long long)size; f.staged = e["staged"].b;
+        f.file.path = norm_rel(f.file.path); f.staged = e["staged"].b;
         m.files.push_back(f);
     }
     out = std::move(m); return true;

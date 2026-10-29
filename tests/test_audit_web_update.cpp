@@ -64,6 +64,20 @@ int main(int argc,char**argv){
  assert(argc==2);base=std::string(argv[1])+"\\run-"+std::to_string(GetCurrentProcessId())+"-"+std::to_string(GetTickCount64());
  assert(base.find("review-fixes")!=std::string::npos || base.find("audit-fixtures")!=std::string::npos);assert(!path_exists(base));assert(ensure_dir(base));
  int checks=0;std::string err;StagingManifest checked;
+ // Archive sizes have the same exact nonnegative-integer contract as file sizes.
+ for(bool full:{false,true}) {
+  auto wire=[&](const std::string& size){return std::string("{\"version\":\"9.8.7\",\"files\":[{\"path\":\"a.dll\",\"size\":1,\"sha256\":\"")+std::string(64,'a')+"\"}],"+
+   (full?"\"full\":{\"url\"":"\"download_url\"")+":\"https://github.com/okhuoyanyan/RLPlayer2/releases/download/v9.8.7/x.zip\""+
+   (size.empty()?"":",\"size\":"+size)+(full?"}}":"}");};
+  for(const char* value:{"-1","1.5","1e300","9007199254740992","null","true","\"10\""}) {
+   assert(!parse_manifest_ext(wire(value)).ok);++checks;
+  }
+  for(const char* value:{"","0","1","9007199254740991"}) {
+   auto m=parse_manifest_ext(wire(value));assert(m.ok);
+   assert((full?m.fullSize:m.deltaSize)==(std::string(value)=="9007199254740991"?9007199254740991LL:std::string(value)=="1"?1:0));++checks;
+  }
+ }
+
  setup();::DeleteFileW(rta::platform::from_utf8(staging_complete_path("9.8.7")).c_str());
  restore_staging_state();assert(!state().staged);assert(!write_ready_plan("9.8.7","1",stage,err));++checks;
  setup();::DeleteFileW(rta::platform::from_utf8(join_path(stage,"b.dll")).c_str());

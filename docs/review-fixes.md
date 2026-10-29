@@ -99,13 +99,13 @@ F12不能解释为禁止已确认缺失条目的独立自动清理。仓库明�
 - 原`capture`测试新增`--offline`只运行原模拟部分；原默认真回环路径保留。此机完整门禁排除`capture`与`wasapi_shared`，另运行`audit_capture_offline`。CI维持原`wasapi_shared`排除，未扩大云端排除集合。
 - 硬件DAC/ASIO驱动、GPU数值、可闻试听、实际在线更新/反馈、磁盘断电耐久不在这些证据中。没有以替身结果声称实机正确。
 
-本次构建的真实WebView2窗口图像见下图（独立进程PID核对、DPI物理坐标抓取；默认空曲库、Null后端）。它证明本次UI能够加载，不作为硬件/音质证据。
+前一轮`4694995`构建的真实WebView2窗口图像见下图（独立进程PID核对、DPI物理坐标抓取；默认空曲库、Null后端）。它证明该轮UI能够加载，不作为本轮新增后端逻辑、硬件或音质证据。
 
 ![本次真实WebView2](review-evidence/real-webview.png)
 
 本地结果及证据摘要如下；远端验收由fork主分支对应提交的Actions记录提供，最终运行链接随对话交付。
 
-## 最终验收结果
+## 第一轮验收结果
 
 - 正式Clang Release全量构建退出0；本地完整CTest **115个目标、0失败、CTest跳过0，622.79秒**。本轮排除真实设备目标`wasapi_shared`和`capture`，保留`audit_capture_offline`的原模拟断言。
 - 完整轮次内部整项目跳过两项：`gpu_bridge`无GPU DLL、`ffmpeg_matrix`缺包内精简工具。随后按仓库官方发行清单SHA256校验400MB包，隔离提取未修改FFmpeg/FFprobe；矩阵实际补跑**38项通过、0失败**，没有用系统完整版替代精简版。
@@ -116,6 +116,30 @@ F12不能解释为禁止已确认缺失条目的独立自动清理。仓库明�
 - 全产品构建使用项目正式Clang工具链；MSVC只完成专项，原巨型UI raw string触及MSVC C2026限制，未声称全产品MSVC兼容。完整`verify.ps1`包含GPU/ROCm前提，本机未运行该整套硬件门禁，也未打包或发布Windows Full版本。
 
 远端记录入口：[Fork CI](https://github.com/steinfigur/RLPlayer2/actions/workflows/ci.yml)。请核对记录的提交SHA和最终状态；本地115目标不包括上述真实设备和GPU验收。
+
+## 二次全链路与边界复核（基线4694995）
+
+本轮由主控独立执行。复用此前117目标CI证据，并针对入口、状态归属和失败返回之间的缺口新增反例；没有把所有潜在路径都声称为已证明正确。
+
+| 问题 | 具体位置/函数 | 修复与验收 |
+|---|---|---|
+| P1：空闲或暂停中的seek泄漏到下一会话 | `tools/rtaweb.cpp`：`PlayerState`、play/lib-play/skip/cast/stop/clear启动交接 | 旧真实exe复现新曲直接从75%处开始。join旧会话后统一`resetControls()`；新会话从零开始，暂停中的待处理seek同样不能泄漏。 |
+| P1：暂停换曲后新曲永久停在0 | 同上 | 旧真实exe复现`playing=true, paused=true, pos=0`。控制请求及实际paused状态随旧会话复位；换曲、skip、clear与stop场景分别验收。 |
+| P2：生产者异常仍被标记正常EOF | `src/audio/render_loop.h`：`pull_chunk/render_loop` | 原正式头文件回归在第528项失败。持队列锁读取done/error，排空有效前缀后不设置normalEnd；保留外层错误传播与停止续播。1/2声道、3/15/16/17帧、每次仅写3帧同时覆盖。 |
+| P1：更新包大小未经校验便窄化 | `src/net/update.h`：`parse_manifest_ext`；`update_staging.h`：`parse_manifest_size` | 旧`update_probe --plan`对1e300、负数、小数、字符串均退出0。包/full/files/staging统一要求非负且精确可表示整数，窄化前拒绝；保留可选大小缺省0，验收0/1/2^53-1与越界/错误类型。 |
+| P2：Knowledge缓存整数越界、失败可能留下部分输出 | `src/meta/knowledge.h`：`knowledge_from_json` | 时间和authority在窄化前检查类型/整数/范围；全部材料解析完成后才发布输出。新增18种坏值组合及输出不变断言，缺省元数据仍兼容零。 |
+| P2：完整请求头末块绕过64KB限制 | `src/net/webui.h`：`WebUi::handle` | 找到分隔符后也检查头部长度；允许有效极限头的结束分隔符分片到达。真实Winsock测cap-1/cap/cap+1/cap+2048及逐字节结束符。 |
+| P1：上传上限错误扩展到前缀相似路由 | 同上；`route_matches` | `/api/uploadXYZ`、`/api/upload/child`恢复普通16MB限制，精确upload及其query仍支持2GB声明；拒绝不完整body而非发布空文件。 |
+| P1：UPnP专辑入口假播放 | `tools/rtaweb.cpp`：`/api/lib/play` | 原专辑入口会启动本地队列，而`make_sink(upnp)`的安全兜底是NullSink，无法控制渲染器。该未实现能力现明确409拒绝，提示使用既有单曲投放/手动切歌；有效库专辑反例检查队列与会话不变。没有伪称补齐UPnP自动专辑播放。 |
+| P1：队列变更后撤销快照未失效 | `tools/rtaweb.cpp`：clear/add/play追加/lib-play/lib-enqueue | 旧真实程序复现清空后退出随机会复活旧歌曲，随机中新增在退出时丢失。结构变更后失效shuffle/sort快照；专辑替换先join旧队列所有者，再发布新队列。新增清空/随机新增/本地专辑交接流程验收。 |
+
+新增`audit_app_edges`执行真实rtaweb：残留seek、暂停换曲、暂停中seek换曲、clear、skip、解码失败停止队列、同路径相邻CUE、UPnP能力拒绝、零帧及单帧源，以及随机快照清空/新增和本地专辑交接，共13个场景。`audit_http_edges`执行真实Winsock；原音频/更新/元数据测试加反例，原门禁和断言未删除。
+
+边界诊断还发现：本机畸形HTTP请求发送完后立即半关闭连接，客户端可能收到ECONNRESET。完全独立的Node TCP回显服务对相同输入也复现，正常请求成功；替换发送标志或显式shutdown的实验均未消除。该现象的系统层原因尚未精确定位，因此不能据此认定RLPlayer特有bug，也没有修改生产传输来掩盖它。复现入口为`node tests/probe_http_half_close.js`，该诊断非零结果不会计成CTest通过。正式HTTP回归保留合法完整请求半关闭，畸形/短body用保持连接并触发接收超时的方式验证同一拒绝分支；畸形半关闭路径仍受本机网络环境限制，未声称验证通过。
+
+本轮证据位于仓库外`../review-fixes/double-check/`：`app-baseline.log`、`queue-baseline.log`、`manifest-baseline.log`、`dsp-baseline.log`、`http-baseline.log`、`echo-control.log`、`build-final.log`、`platform-boundary.log`及`targeted.log`。Linux GCC的UBSAN及float-cast-overflow运行26项暂存/数值契约检查，退出0。WSL直接启动Windows PowerShell时，本轮观察到其原生子进程未执行且无退出码；这些无效驱动结果不计成功。正式Windows构建及CTest均经Windows cmd父进程启动，并检查实际退出码。最终远端结果以本轮提交对应的Actions记录为准，交付对话附精确运行链接。
+
+本轮最终本地相关CTest：**18目标、0失败、0跳过、退出0，102.55秒**。其中真实应用13个边界场景、HTTP17项、Windows音频/回调1031项、元数据130项、更新41项；[验收摘要](review-evidence/double-check-verification.json)绑定本轮rtaweb二进制摘要。完整CI会在最终提交重新运行。未穷举所有线程交错及播放中任意队列编辑的排列组合；真实DAC/ASIO/GPU、在线服务、私有曲库和断电耐久仍不在验证范围内。
 
 ## 复现入口
 

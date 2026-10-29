@@ -17,5 +17,11 @@ int main(){
  for(const char*p:{"../a","C:\\a","a:b","a\\..\\b","a\\","a//b","a. ","CON.txt","aux","a\nb"}){assert(!safe_install_rel(p));++checks;}
  m.files.push_back({{"A.DLL",sha256_hex("a"),1},true});assert(!parse_staging_manifest(serialize_staging_manifest(m),out,err));++checks;
  m.files.pop_back();m.files[0].staged=false;assert(!validate_staging_manifest(m,m.version,m.installDir,[](const auto&){return true;},err));++checks;
+ for(const char* wire:{"-1","1.5","1e300","9007199254740992","null","true","\"10\""}){
+  long long size=123;assert(!parse_manifest_size(rta::net::json_parse(wire),size));assert(size==123);++checks;
+ }
+ for(const char* wire:{"0","1","9007199254740991"}){
+  long long size=-1;assert(parse_manifest_size(rta::net::json_parse(wire),size));assert(size>=0);++checks;
+ }
  std::cout<<"PASS "<<checks<<" portable staging contract cases\n";
 }

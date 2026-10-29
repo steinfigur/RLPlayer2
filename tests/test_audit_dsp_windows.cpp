@@ -79,15 +79,15 @@ struct CaptureSink:render::OutSink {
     size_t write_one_period(const int32_t*p,size_t n)override{size_t count=std::min(limit,n);const bool first=out.empty();out.insert(out.end(),p,p+count*ch);if(first&&firstWrite)firstWrite();return count;}
 };
 static void rendering() {
-    for(int channels:{1,2})for(size_t frames:{3u,15u,16u,17u}) {
+    for(bool producerError:{false,true})for(int channels:{1,2})for(size_t frames:{3u,15u,16u,17u}) {
         render::RenderQ q;audio::AudioBuffer chunk;chunk.rate=176400;chunk.bits=24;chunk.channels=channels;chunk.raw.resize(frames*channels);
         for(size_t n=0;n<frames;++n)for(int c=0;c<channels;++c)chunk.raw[n*channels+c]=(int32_t)(0x050000|((n*17+c)&0xffff));
-        q.q.push_back({chunk,1});q.done=true;std::atomic<bool>stop{false},pause{false},paused{false};std::atomic<double>seek{-1},volume{-12},start{0},peak{0};
+        q.q.push_back({chunk,1});q.done=true;q.error=producerError;q.err=producerError?"synthetic truncated source":"";std::atomic<bool>stop{false},pause{false},paused{false};std::atomic<double>seek{-1},volume{-12},start{0},peak{0};
         std::atomic<size_t>played{0};std::atomic<long long>pad{0},w0{0},wr{0},pulls{0},clip{0};bool gpu=false;
         render::RenderHost h;h.stop=&stop;h.pauseReq=&pause;h.paused=&paused;h.seekReq=&seek;h.volDb=&volume;h.startDb=&start;h.played=&played;h.dbgPad=&pad;h.gpuOut=&gpu;
         h.rq=&q;h.deviceRate=176400;h.inRate=176400;h.inFrames=frames;h.totalOut=frames;h.outBits=24;h.outCh=channels;h.dbgW0=&w0;h.dbgWr=&wr;h.dbgPulls=&pulls;h.dbgClip=&clip;h.dbgPeak=&peak;
         h.dop=true;h.starveEnabled=false;h.deviceGuardEnabled=false;CaptureSink sink;sink.ch=channels;
-        const bool doSeek=channels==2&&frames==17;
+        const bool doSeek=!producerError&&channels==2&&frames==17;
         std::thread simulatedProducer;
         if(doSeek) {
             sink.firstWrite=[&]{seek.store(.5);};
@@ -103,7 +103,7 @@ static void rendering() {
         }
         render::render_loop(sink,h);
         if(simulatedProducer.joinable())simulatedProducer.join();
-        ck(h.normalEnd&&!h.renderFail&&sink.mode&&sink.gain==0,"DoP render mode and live-gain domain");
+        ck(h.normalEnd==!producerError&&!h.renderFail&&sink.mode&&sink.gain==0,"producer failure cannot report normal EOF; DoP mode and gain remain correct");
         ck(played.load()==(doSeek?13:frames),"EOF device padding does not advance source progress");
         const size_t sourceFrames=doSeek?8:frames;
         ck(sink.out.size()==((sourceFrames+15)/16)*16*channels,"DoP EOF exact bounded final device block");

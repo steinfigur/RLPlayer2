@@ -85,5 +85,12 @@ int main(int argc, char** argv) {
     const auto track = meta_path_of(base) / "tracks" / (store.hashOf("track.wav") + ".json");
     check(entity_write_atomic(track, "{\"path\":\"track.wav\",\"fields\":{\"title\":{\"value\":\"PARTIAL"));
     TrackMeta meta; check(!store.load("track.wav", meta));
+    // Corrupt numeric cache metadata must not overflow a cast or publish a partial result.
+    for(const char* key:{"fetched_at","expires_at","authority"}) for(const char* value:{"1e300","-1e300","1.5","true","null","\"42\""}) {
+        const std::string wire=std::string("{\"entity_id\":\"changed\",\"subject\":\"changed\",\"materials\":[{\"url\":\"https://first.invalid\"},{\"url\":\"https://bad.invalid\",\"")+key+"\":"+value+"}]}";
+        std::vector<KnowledgeMaterial> output{zh};std::string entity="original",subject="original",error;
+        check(!knowledge_from_json(wire,output,entity,subject,&error));
+        check(output.size()==1&&output[0].url==zh.url&&entity=="original"&&subject=="original"&&!error.empty());
+    }
     std::cout << "PASS metadata " << checks << " checks\n";
 }
